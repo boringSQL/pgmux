@@ -13,28 +13,30 @@ import (
 	"github.com/jackc/pgproto3/v2"
 )
 
-// ConnectionPool manages a pool of connections to a backend server
-type ConnectionPool struct {
-	mu          sync.Mutex
-	connections []*BackendConnection
-	maxSize     int
-	config      *BackendConfig
-}
+type (
+	// ConnectionPool manages a pool of connections to a backend server
+	ConnectionPool struct {
+		mu          sync.Mutex
+		connections []*BackendConnection
+		maxSize     int
+		config      *BackendConfig
+	}
 
-// BackendConnection represents a connection to a backend PostgreSQL server
-type BackendConnection struct {
-	conn     net.Conn
-	inUse    bool
-	lastUsed time.Time
-}
+	// BackendConnection represents a connection to a backend PostgreSQL server
+	BackendConnection struct {
+		conn     net.Conn
+		inUse    bool
+		lastUsed time.Time
+	}
 
-// ProxyServer is a PostgreSQL proxy server that routes connections based on username
-type ProxyServer struct {
-	listenAddr string
-	router     Router
-	pools      map[string]*ConnectionPool
-	mu         sync.RWMutex
-}
+	// ProxyServer is a PostgreSQL proxy server that routes connections based on username
+	ProxyServer struct {
+		listenAddr string
+		router     Router
+		pools      map[string]*ConnectionPool
+		mu         sync.RWMutex
+	}
+)
 
 // NewProxyServer creates a new ProxyServer with the given listen address and router
 func NewProxyServer(listenAddr string, router Router) *ProxyServer {
@@ -116,8 +118,8 @@ func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn
 }
 
 func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *pgproto3.Backend,
-	startupMsg *pgproto3.StartupMessage, clientConn net.Conn) {
-
+	startupMsg *pgproto3.StartupMessage, clientConn net.Conn,
+) {
 	originalUser := startupMsg.Parameters["user"]
 	log.Printf("New connection for user: %s", originalUser)
 	log.Printf("Startup parameters: %+v", startupMsg.Parameters)
@@ -184,7 +186,8 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 }
 
 func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, serverFrontend *pgproto3.Frontend,
-	clientConn, serverConn net.Conn) error {
+	clientConn, serverConn net.Conn,
+) error {
 	// Set a reasonable timeout for authentication
 	serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	clientConn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -372,7 +375,8 @@ func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, ser
 }
 
 func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto3.Backend,
-	serverFrontend *pgproto3.Frontend, clientConn, serverConn net.Conn) {
+	serverFrontend *pgproto3.Frontend, clientConn, serverConn net.Conn,
+) {
 	errChan := make(chan error, 2)
 
 	// Client to server
