@@ -55,6 +55,12 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 
 	log.Printf("PostgreSQL proxy listening on %s", ps.listenAddr)
 
+	// Close listener when context is cancelled
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
