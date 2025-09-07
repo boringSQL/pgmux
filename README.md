@@ -4,12 +4,15 @@ pgMux is a lightweight PostgreSQL routing proxy designed for development and
 testing environments. It routes client connections to different backends based
 on username, with full PostgreSQL protocol support and pluggable routing logic.
 
+![pgMux Overview][pgMux-overview.png]
+
 Originally created to provide routing for [SQL Labs](https://labs.boringsql.com/)
 
 ## Features
 
 - Username-based routing to different PostgreSQL backends
 - Full PostgreSQL protocol support (SASL, MD5, cleartext auth)
+- SSL/TLS support for secure client connections
 - Pluggable routing via Router interface
 
 ## Quick Start
@@ -41,6 +44,34 @@ func main() {
 ```
 
 Connect with: `psql -h localhost -p 5434 -U app_user -d mydb`
+
+## TLS Configuration
+
+Enable SSL/TLS for secure client connections:
+
+```go
+proxy := pgmux.NewProxyServer(":5434", router)
+proxy.WithTLS(&pgmux.TLSConfig{
+    Enabled:  true,
+    CertFile: "server.crt",
+    KeyFile:  "server.key",
+})
+proxy.Start(ctx)
+```
+
+Connect with TLS: `psql 'host=localhost port=5434 user=app_user dbname=mydb sslmode=require'`
+
+For advanced TLS settings:
+
+```go
+proxy.WithTLS(&pgmux.TLSConfig{
+    Enabled: true,
+    Config: &tls.Config{
+        MinVersion: tls.VersionTLS13,
+        // Custom certificates, cipher suites, etc.
+    },
+})
+```
 
 ## Router Interface
 
@@ -90,6 +121,7 @@ func (r *RestRouter) Route(ctx context.Context, username string) (*pgmux.Backend
 See `examples/` directory:
 
 - `examples/static/` - Static routing example
+- `examples/tls/` - TLS/SSL configuration example
 
 ## Protocol Support
 
@@ -100,6 +132,9 @@ See `examples/` directory:
 ## Limitations
 
 - **Development use only** - pgMux is not (yet) robust enough for high-throughput production environments
-- No SSL/TLS support (rejects SSL requests)
 - No connection pooling (creates new backend connection per client)
 - No query rewriting or filtering (not planned at this time)
+- TLS support is for client connections only (backend connections use plain TCP)
+
+<-- MARKDOWN LINKS & IMAGES -->
+[pgmux-overview]: pgMux-overview.png

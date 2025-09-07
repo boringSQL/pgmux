@@ -2,6 +2,7 @@ package pgmux
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -29,12 +30,25 @@ type (
 		lastUsed time.Time
 	}
 
+	// TLSConfig holds TLS configuration for the proxy server
+	TLSConfig struct {
+		// Enable TLS support
+		Enabled bool
+		// Path to certificate file
+		CertFile string
+		// Path to key file
+		KeyFile string
+		// Optional TLS config for advanced settings
+		Config *tls.Config
+	}
+
 	// ProxyServer is a PostgreSQL proxy server that routes connections based on username
 	ProxyServer struct {
 		listenAddr string
 		router     Router
 		pools      map[string]*ConnectionPool
 		mu         sync.RWMutex
+		tlsConfig  *TLSConfig
 	}
 )
 
@@ -47,15 +61,27 @@ func NewProxyServer(listenAddr string, router Router) *ProxyServer {
 	}
 }
 
+// WithTLS configures TLS support for the proxy server
+func (ps *ProxyServer) WithTLS(config *TLSConfig) *ProxyServer {
+	ps.tlsConfig = config
+	return ps
+}
+
 // Start starts the proxy server and listens for connections
 func (ps *ProxyServer) Start(ctx context.Context) error {
+	// Always start with a plain TCP listener
+	// TLS upgrade happens after SSL negotiation
 	listener, err := net.Listen("tcp", ps.listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 	defer listener.Close()
 
-	log.Printf("PostgreSQL proxy listening on %s", ps.listenAddr)
+	if ps.tlsConfig != nil && ps.tlsConfig.Enabled {
+		log.Printf("PostgreSQL proxy listening on %s (TLS available)", ps.listenAddr)
+	} else {
+		log.Printf("PostgreSQL proxy listening on %s", ps.listenAddr)
+	}
 
 	// Close listener when context is cancelled
 	go func() {
@@ -97,20 +123,73 @@ func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn
 		log.Printf("Protocol version: %d.%d", msg.ProtocolVersion>>16, msg.ProtocolVersion&0xFFFF)
 		ps.handleStartupMessage(ctx, backend, msg, clientConn)
 	case *pgproto3.SSLRequest:
-		_, err := clientConn.Write([]byte{'N'})
-		if err != nil {
-			log.Printf("Failed to send SSL response: %v", err)
-			return
-		}
+		// Handle SSL negotiation
+		if ps.tlsConfig != nil && ps.tlsConfig.Enabled {
+			// Send 'S' to indicate SSL is supported
+			_, err := clientConn.Write([]byte{'S'})
+			if err != nil {
+				log.Printf("Failed to send SSL response: %v", err)
+				return
+			}
 
-		startupMsg, err := backend.ReceiveStartupMessage()
-		if err != nil {
-			log.Printf("Failed to receive startup message after SSL: %v", err)
-			return
-		}
+			// Upgrade connection to TLS
+			var tlsConfig *tls.Config
+			if ps.tlsConfig.Config != nil {
+				tlsConfig = ps.tlsConfig.Config
+			} else if ps.tlsConfig.CertFile != "" && ps.tlsConfig.KeyFile != "" {
+				cert, err := tls.LoadX509KeyPair(ps.tlsConfig.CertFile, ps.tlsConfig.KeyFile)
+				if err != nil {
+					log.Printf("Failed to load TLS certificates: %v", err)
+					return
+				}
+				tlsConfig = &tls.Config{
+					Certificates: []tls.Certificate{cert},
+				}
+			} else {
+				log.Printf("TLS enabled but no certificates configured")
+				return
+			}
 
-		if sm, ok := startupMsg.(*pgproto3.StartupMessage); ok {
-			ps.handleStartupMessage(ctx, backend, sm, clientConn)
+			// Perform TLS handshake
+			tlsConn := tls.Server(clientConn, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				log.Printf("TLS handshake failed: %v", err)
+				return
+			}
+
+			log.Printf("TLS connection established")
+
+			// Create new backend with TLS connection
+			tlsBackend := pgproto3.NewBackend(pgproto3.NewChunkReader(tlsConn), tlsConn)
+
+			// Receive the actual startup message over TLS
+			startupMsg, err := tlsBackend.ReceiveStartupMessage()
+			if err != nil {
+				log.Printf("Failed to receive startup message after TLS: %v", err)
+				return
+			}
+
+			if sm, ok := startupMsg.(*pgproto3.StartupMessage); ok {
+				ps.handleStartupMessage(ctx, tlsBackend, sm, tlsConn)
+			}
+		} else {
+			// TLS not configured, respond with 'N'
+			_, err := clientConn.Write([]byte{'N'})
+			if err != nil {
+				log.Printf("Failed to send SSL response: %v", err)
+				return
+			}
+
+			// Continue to receive the actual startup message without TLS
+			startupMsg, err := backend.ReceiveStartupMessage()
+			if err != nil {
+				log.Printf("Failed to receive startup message after SSL: %v", err)
+				return
+			}
+
+			if sm, ok := startupMsg.(*pgproto3.StartupMessage); ok {
+				ps.handleStartupMessage(ctx, backend, sm, clientConn)
+			}
 		}
 	default:
 		log.Printf("Unexpected startup message type: %T", msg)
