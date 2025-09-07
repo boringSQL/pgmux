@@ -4,8 +4,6 @@ pgMux is a lightweight PostgreSQL routing proxy designed for development and
 testing environments. It routes client connections to different backends based
 on username, with full PostgreSQL protocol support and pluggable routing logic.
 
-![pgMux Overview][pgMux-overview.png]
-
 Originally created to provide routing for [SQL Labs](https://labs.boringsql.com/)
 
 ## Features
@@ -135,6 +133,3 @@ See `examples/` directory:
 - No connection pooling (creates new backend connection per client)
 - No query rewriting or filtering (not planned at this time)
 - TLS support is for client connections only (backend connections use plain TCP)
-
-<-- MARKDOWN LINKS & IMAGES -->
-[pgmux-overview]: pgMux-overview.png
