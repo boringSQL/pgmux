@@ -9,7 +9,7 @@ Originally created to provide routing for [SQL Labs](https://labs.boringsql.com/
 ## Features
 
 - Username-based routing to different PostgreSQL backends
-- Full PostgreSQL protocol support (SASL, MD5, cleartext auth)
+- Full PostgreSQL protocol support
 - SSL/TLS support for secure client connections
 - Pluggable routing via Router interface
 
@@ -124,8 +124,10 @@ See `examples/` directory:
 ## Protocol Support
 
 - PostgreSQL wire protocol v3.0
-- Authentication: SASL-SCRAM-SHA-256, MD5, cleartext
+- Authentication: SASL-SCRAM-SHA-256, cleartext
 - All standard PostgreSQL messages
+
+Please note, MD5 authentication won't work if the username is rewritten by a proxy, because the username is part of the MD5 password hash calculation in PostgreSQL.
 
 ## Limitations
 
