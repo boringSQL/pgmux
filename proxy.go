@@ -225,11 +225,30 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 		return
 	}
 
-	// Create new connection for authentication
+	// Create new connection for authentication (with retries for port changes)
 	addr := net.JoinHostPort(backendConfig.Host, strconv.Itoa(backendConfig.Port))
 	log.Printf("Connecting to backend %s as user %s", addr, backendConfig.User)
 
-	backendConn, err := net.Dial("tcp", addr)
+	var backendConn net.Conn
+	maxRetries := 3
+	for attempt := range maxRetries {
+		if attempt > 0 {
+			// progressive wait
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			backendConfig, err = ps.router.Route(ctx, originalUser)
+			if err != nil {
+				break
+			}
+			addr = net.JoinHostPort(backendConfig.Host, strconv.Itoa(backendConfig.Port))
+			log.Printf("Retrying backend connection (attempt %d) to %s", attempt+1, addr)
+		}
+		dialer := net.Dialer{Timeout: 5 * time.Second}
+		backendConn, err = dialer.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			break
+		}
+		log.Printf("Backend dial failed (attempt %d/%d): %v", attempt+1, maxRetries, err)
+	}
 	if err != nil {
 		errorMsg := &pgproto3.ErrorResponse{
 			Severity: "FATAL",
