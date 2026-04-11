@@ -42,6 +42,13 @@ type (
 		Config *tls.Config
 	}
 
+	// Limits configures runtime resource limits on the proxy.
+	Limits struct {
+		// MaxConnections caps the number of concurrent client connections
+		// the proxy will handle. Zero or negative means use the default (1024).
+		MaxConnections int
+	}
+
 	// ProxyServer is a PostgreSQL proxy server that routes connections based on username
 	ProxyServer struct {
 		listenAddr string
@@ -49,8 +56,11 @@ type (
 		pools      map[string]*ConnectionPool
 		mu         sync.RWMutex
 		tlsConfig  *TLSConfig
+		limits     *Limits
 	}
 )
+
+const defaultMaxConnections = 1024
 
 // NewProxyServer creates a new ProxyServer with the given listen address and router
 func NewProxyServer(listenAddr string, router Router) *ProxyServer {
@@ -67,6 +77,19 @@ func (ps *ProxyServer) WithTLS(config *TLSConfig) *ProxyServer {
 	return ps
 }
 
+// WithLimits configures resource limits for the proxy server.
+func (ps *ProxyServer) WithLimits(limits *Limits) *ProxyServer {
+	ps.limits = limits
+	return ps
+}
+
+func (ps *ProxyServer) maxConnections() int {
+	if ps.limits != nil && ps.limits.MaxConnections > 0 {
+		return ps.limits.MaxConnections
+	}
+	return defaultMaxConnections
+}
+
 // Start starts the proxy server and listens for connections
 func (ps *ProxyServer) Start(ctx context.Context) error {
 	// Always start with a plain TCP listener
@@ -77,11 +100,13 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 	}
 	defer listener.Close()
 
+	sem := make(chan struct{}, ps.maxConnections())
+
+	tlsSuffix := ""
 	if ps.tlsConfig != nil && ps.tlsConfig.Enabled {
-		log.Printf("PostgreSQL proxy listening on %s (TLS available)", ps.listenAddr)
-	} else {
-		log.Printf("PostgreSQL proxy listening on %s", ps.listenAddr)
+		tlsSuffix = " (TLS available)"
 	}
+	log.Printf("PostgreSQL proxy listening on %s%s (max connections: %d)", ps.listenAddr, tlsSuffix, cap(sem))
 
 	// Close listener when context is cancelled
 	go func() {
@@ -101,8 +126,29 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 			}
 		}
 
-		go ps.handleConnection(ctx, conn)
+		select {
+		case sem <- struct{}{}:
+			go func() {
+				defer func() { <-sem }()
+				ps.handleConnection(ctx, conn)
+			}()
+		default:
+			ps.rejectOverCapacity(conn)
+		}
 	}
+}
+
+func (ps *ProxyServer) rejectOverCapacity(conn net.Conn) {
+	defer conn.Close()
+	log.Printf("Rejecting connection from %s: at max connections", conn.RemoteAddr())
+	errorMsg := &pgproto3.ErrorResponse{
+		Severity: "FATAL",
+		Code:     "53300",
+		Message:  "too many connections for proxy",
+	}
+	buf, _ := errorMsg.Encode(nil)
+	conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+	_, _ = conn.Write(buf)
 }
 
 func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn) {
