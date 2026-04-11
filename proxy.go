@@ -45,8 +45,9 @@ type (
 	// Limits configures runtime resource limits on the proxy.
 	// Zero or negative values fall back to defaults.
 	Limits struct {
-		MaxConnections int // default 1024
-		MaxMessageSize int // bytes, default 16 MiB; applies to client-facing reads only
+		MaxConnections    int           // default 1024
+		MaxMessageSize    int           // bytes, default 16 MiB; applies to client-facing reads only
+		ClientIdleTimeout time.Duration // kills conn if client sends nothing for this long; 0 disables (default)
 	}
 
 	// ProxyServer is a PostgreSQL proxy server that routes connections based on username
@@ -117,6 +118,13 @@ func (ps *ProxyServer) maxMessageSize() int {
 		return ps.limits.MaxMessageSize
 	}
 	return defaultMaxMessageSize
+}
+
+func (ps *ProxyServer) clientIdleTimeout() time.Duration {
+	if ps.limits != nil && ps.limits.ClientIdleTimeout > 0 {
+		return ps.limits.ClientIdleTimeout
+	}
+	return 0
 }
 
 // Start starts the proxy server and listens for connections
@@ -553,6 +561,8 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 ) {
 	errChan := make(chan error, 2)
 
+	idle := ps.clientIdleTimeout()
+
 	// Client to server
 	go func() {
 		for {
@@ -560,6 +570,9 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 			case <-ctx.Done():
 				return
 			default:
+				if idle > 0 {
+					clientConn.SetReadDeadline(time.Now().Add(idle))
+				}
 				msg, err := clientBackend.Receive()
 				if err != nil {
 					if err != io.EOF && !isConnectionClosed(err) {
