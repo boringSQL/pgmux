@@ -60,7 +60,10 @@ type (
 	}
 )
 
-const defaultMaxConnections = 1024
+const (
+	defaultMaxConnections = 1024
+	tlsHandshakeTimeout   = 10 * time.Second
+)
 
 // NewProxyServer creates a new ProxyServer with the given listen address and router
 func NewProxyServer(listenAddr string, router Router) *ProxyServer {
@@ -196,12 +199,15 @@ func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn
 				return
 			}
 
-			// Perform TLS handshake
+			// Perform TLS handshake with a deadline so an idle peer cannot
+			// pin the handler indefinitely after accepting SSLRequest.
 			tlsConn := tls.Server(clientConn, tlsConfig)
+			clientConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
 			if err := tlsConn.Handshake(); err != nil {
 				log.Printf("TLS handshake failed: %v", err)
 				return
 			}
+			clientConn.SetDeadline(time.Time{})
 
 			log.Printf("TLS connection established")
 
