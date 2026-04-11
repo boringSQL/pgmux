@@ -43,10 +43,10 @@ type (
 	}
 
 	// Limits configures runtime resource limits on the proxy.
+	// Zero or negative values fall back to defaults.
 	Limits struct {
-		// MaxConnections caps the number of concurrent client connections
-		// the proxy will handle. Zero or negative means use the default (1024).
-		MaxConnections int
+		MaxConnections int // default 1024
+		MaxMessageSize int // bytes, default 16 MiB; applies to client-facing reads only
 	}
 
 	// ProxyServer is a PostgreSQL proxy server that routes connections based on username
@@ -62,8 +62,27 @@ type (
 
 const (
 	defaultMaxConnections = 1024
+	defaultMaxMessageSize = 16 * 1024 * 1024
 	tlsHandshakeTimeout   = 10 * time.Second
 )
+
+// cappedChunkReader rejects Next(n) when n exceeds max, before pgproto3
+// allocates buffer sized from an attacker-controlled wire length prefix.
+type cappedChunkReader struct {
+	inner pgproto3.ChunkReader
+	max   int
+}
+
+func (c *cappedChunkReader) Next(n int) ([]byte, error) {
+	if n > c.max {
+		return nil, fmt.Errorf("pgmux: client message size %d exceeds max %d", n, c.max)
+	}
+	return c.inner.Next(n)
+}
+
+func (ps *ProxyServer) newClientChunkReader(r io.Reader) pgproto3.ChunkReader {
+	return &cappedChunkReader{inner: pgproto3.NewChunkReader(r), max: ps.maxMessageSize()}
+}
 
 // NewProxyServer creates a new ProxyServer with the given listen address and router
 func NewProxyServer(listenAddr string, router Router) *ProxyServer {
@@ -91,6 +110,13 @@ func (ps *ProxyServer) maxConnections() int {
 		return ps.limits.MaxConnections
 	}
 	return defaultMaxConnections
+}
+
+func (ps *ProxyServer) maxMessageSize() int {
+	if ps.limits != nil && ps.limits.MaxMessageSize > 0 {
+		return ps.limits.MaxMessageSize
+	}
+	return defaultMaxMessageSize
 }
 
 // Start starts the proxy server and listens for connections
@@ -157,7 +183,7 @@ func (ps *ProxyServer) rejectOverCapacity(conn net.Conn) {
 func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn) {
 	defer clientConn.Close()
 
-	backend := pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn)
+	backend := pgproto3.NewBackend(ps.newClientChunkReader(clientConn), clientConn)
 
 	startupMsg, err := backend.ReceiveStartupMessage()
 	if err != nil {
@@ -199,8 +225,6 @@ func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn
 				return
 			}
 
-			// Perform TLS handshake with a deadline so an idle peer cannot
-			// pin the handler indefinitely after accepting SSLRequest.
 			tlsConn := tls.Server(clientConn, tlsConfig)
 			clientConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
 			if err := tlsConn.Handshake(); err != nil {
@@ -212,7 +236,7 @@ func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn
 			log.Printf("TLS connection established")
 
 			// Create new backend with TLS connection
-			tlsBackend := pgproto3.NewBackend(pgproto3.NewChunkReader(tlsConn), tlsConn)
+			tlsBackend := pgproto3.NewBackend(ps.newClientChunkReader(tlsConn), tlsConn)
 
 			// Receive the actual startup message over TLS
 			startupMsg, err := tlsBackend.ReceiveStartupMessage()
