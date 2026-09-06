@@ -206,3 +206,98 @@ func TestForceCloseCutsBackendConns(t *testing.T) {
 		}
 	}
 }
+
+func TestStatsBeforeStart(t *testing.T) {
+	proxy := NewProxyServer(pickFreePort(t), NewStaticRouter(nil))
+	got := proxy.Stats()
+	if got.Current != 0 || got.Accepted != 0 || got.Rejected != 0 {
+		t.Errorf("Stats() = %+v, want zeroed counters", got)
+	}
+	if got.Max != defaultMaxConnections {
+		t.Errorf("Stats().Max = %d, want the default %d", got.Max, defaultMaxConnections)
+	}
+}
+
+// Accepted must match the "connection accepted" log lines one for one, and a
+// connection refused at the cap must count as rejected rather than accepted.
+func TestStatsCountsAcceptedAndRejected(t *testing.T) {
+	addr := pickFreePort(t)
+	proxy := NewProxyServer(addr, NewStaticRouter(nil)).WithLimits(&Limits{MaxConnections: 1})
+	proxy.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	done := make(chan error, 1)
+	go func() { done <- proxy.Start(context.Background()) }()
+	t.Cleanup(func() { proxy.Shutdown(context.Background()); <-done })
+
+	conn1 := dialUntilReady(t, addr)
+	defer conn1.Close()
+	// Let the handler reach ReceiveStartupMessage so the semaphore is full.
+	time.Sleep(100 * time.Millisecond)
+
+	if got := proxy.Stats(); got.Current != 1 || got.Accepted != 1 || got.Rejected != 0 {
+		t.Fatalf("after one connection Stats() = %+v", got)
+	}
+
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn2.Close()
+	assertRejectedOverCapacity(t, conn2)
+
+	if got := proxy.Stats(); got.Accepted != 1 || got.Rejected != 1 {
+		t.Errorf("after a refused connection Stats() = %+v, want accepted 1 rejected 1", got)
+	}
+	if got := proxy.Stats(); got.Max != 1 {
+		t.Errorf("Stats().Max = %d, want the configured 1", got.Max)
+	}
+
+	// Freeing the slot must bring Current back down without touching totals.
+	conn1.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for proxy.Stats().Current != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := proxy.Stats(); got.Current != 0 || got.Accepted != 1 {
+		t.Errorf("after the session ended Stats() = %+v, want current 0 accepted 1", got)
+	}
+}
+
+// The point of Addr is recovering the real port after listening on :0.
+func TestAddrReportsBoundPort(t *testing.T) {
+	proxy := NewProxyServer("127.0.0.1:0", NewStaticRouter(nil))
+	proxy.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if proxy.Addr() != nil {
+		t.Error("Addr() is non-nil before Start")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- proxy.Start(context.Background()) }()
+
+	var addr net.Addr
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if addr = proxy.Addr(); addr != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if addr == nil {
+		t.Fatal("Addr() stayed nil after Start")
+	}
+	if _, port, _ := net.SplitHostPort(addr.String()); port == "0" || port == "" {
+		t.Fatalf("Addr() = %s, want a resolved port", addr)
+	}
+	dialUntilReady(t, addr.String()).Close()
+
+	// Nil again once Start returns: the listener is closed by then, so handing
+	// back its address would name a port the proxy no longer holds.
+	if err := proxy.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	<-done
+	if got := proxy.Addr(); got != nil {
+		t.Errorf("Addr() = %v after Start returned, want nil", got)
+	}
+}

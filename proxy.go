@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgproto3/v2"
@@ -47,6 +48,9 @@ type (
 		conns          map[net.Conn]struct{}
 		backendConns   map[net.Conn]struct{}
 		wg             sync.WaitGroup
+		sem            chan struct{}
+		accepted       atomic.Uint64
+		rejected       atomic.Uint64
 		tlsConfig      *TLSConfig
 		limits         *Limits
 		logger         *slog.Logger
@@ -58,6 +62,14 @@ type (
 	// It runs after routing and the user/database rewrites, immediately before
 	// the StartupMessage is encoded. pgmux ships no policy of its own here.
 	StartupRewriteFunc func(clientAddr net.Addr, params map[string]string)
+
+	// Stats is a point-in-time view of the proxy's connection accounting.
+	Stats struct {
+		Current  int    // sessions being handled right now
+		Accepted uint64 // connections admitted since Start
+		Rejected uint64 // connections refused at the connection cap
+		Max      int    // configured connection cap
+	}
 )
 
 // Client-visible failure messages are fixed strings: a wrapped Go error would
@@ -203,6 +215,9 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 	}()
 
 	sem := make(chan struct{}, ps.maxConnections())
+	ps.mu.Lock()
+	ps.sem = sem
+	ps.mu.Unlock()
 
 	ps.log().Info("proxy listening",
 		"addr", ps.listenAddr,
@@ -248,6 +263,7 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 			}
 			// Logged only on the accepted path, so counting these lines gives
 			// the connection count even when the cap is being hit.
+			ps.accepted.Add(1)
 			ps.log().Info("connection accepted", "client", conn.RemoteAddr().String())
 			go func() {
 				defer func() { <-sem }()
@@ -256,6 +272,7 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 				ps.handleConnection(ctx, conn)
 			}()
 		default:
+			ps.rejected.Add(1)
 			// In a goroutine so a client that stops reading cannot stall the
 			// accept loop.
 			go func() {
@@ -264,6 +281,34 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 			}()
 		}
 	}
+}
+
+// Stats reports the proxy's current connection accounting. Safe to call
+// before Start and after Shutdown.
+func (ps *ProxyServer) Stats() Stats {
+	ps.mu.RLock()
+	sem := ps.sem
+	ps.mu.RUnlock()
+
+	// Current reads the semaphore so the live count cannot drift from the cap.
+	return Stats{
+		Current:  len(sem),
+		Accepted: ps.accepted.Load(),
+		Rejected: ps.rejected.Load(),
+		Max:      ps.maxConnections(),
+	}
+}
+
+// Addr returns the address the proxy is listening on, or nil when it is not
+// listening. Use it to recover the real port after listening on :0.
+func (ps *ProxyServer) Addr() net.Addr {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	if ps.listener == nil {
+		return nil
+	}
+	return ps.listener.Addr()
 }
 
 // trackConn registers an accepted connection so Shutdown can wait for it and
