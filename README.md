@@ -134,4 +134,14 @@ Please note, MD5 authentication won't work if the username is rewritten by a pro
 - **Development use only** - pgMux is not (yet) robust enough for high-throughput production environments
 - No connection pooling (creates new backend connection per client)
 - No query rewriting or filtering (not planned at this time)
-- TLS support is for client connections only (backend connections use plain TCP)
+- TLS support to the client is always available; TLS to the backend is opt-in per `BackendConfig` (see Security model)
+
+## Security model
+
+pgMux terminates client TLS and forwards to the backend over plain TCP. This has consequences a SCRAM-aware operator should be aware of before pointing it at anything trust-sensitive:
+
+- **Backend hop is cleartext by default.** Without `BackendConfig.TLS` set, the pgMux→backend connection carries the full SCRAM-SHA-256 exchange and all subsequent session traffic without encryption. Anyone able to observe that path (host, container network, sidecar, shared LAN) sees credential-equivalent material under SCRAM's threat model. Set `BackendConfig.TLS = &tls.Config{...}` to make pgMux send the PostgreSQL `SSLRequest` to the backend and upgrade the connection; pgMux refuses to proceed if the backend declines SSL rather than silently downgrading.
+- **Channel binding is not end-to-end.** Because the backend sees plain TCP, it never advertises `SCRAM-SHA-256-PLUS`. A client that sets `channel_binding=require` will fail to connect; a client that leaves it at libpq's default (`prefer`) silently negotiates `SCRAM-SHA-256` with no binding. The TLS between client and pgMux protects the client↔pgMux hop only — it does not bind the authentication to that session in any way the backend can verify.
+- **Trust direction matters.** Do not point pgMux at a backend in a higher trust tier than the host pgMux runs on. In particular, do not use it as a hop in front of managed-database services, production clusters, or any backend whose `pg_authid` you do not want exposed to whoever can read traffic on the pgMux host.
+
+Appropriate uses are the ones pgMux was built for: routing development/lab traffic to ephemeral backends where the auth material is itself disposable.

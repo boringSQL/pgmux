@@ -2,6 +2,7 @@ package pgmux
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 )
 
@@ -14,6 +15,12 @@ type (
 		Host string
 		Port int
 		User string
+		// TLS, when non-nil, makes pgmux issue a PostgreSQL SSLRequest before
+		// the StartupMessage and upgrade the backend connection to TLS using
+		// this config. If the backend refuses SSL, the connection is rejected
+		// rather than silently downgraded — the goal is to keep the SCRAM
+		// exchange off the wire, so a downgrade defeats the point.
+		TLS *tls.Config
 	}
 
 	// Router defines the interface for routing PostgreSQL connections

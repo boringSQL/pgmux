@@ -345,6 +345,22 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 	}
 	defer backendConn.Close()
 
+	if backendConfig.TLS != nil {
+		upgraded, err := upgradeBackendToTLS(ctx, backendConn, backendConfig.TLS)
+		if err != nil {
+			log.Printf("Backend TLS negotiation failed: %v", err)
+			errorMsg := &pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "08001",
+				Message:  fmt.Sprintf("Backend TLS negotiation failed: %v", err),
+			}
+			buf, _ := errorMsg.Encode(nil)
+			clientConn.Write(buf)
+			return
+		}
+		backendConn = upgraded
+	}
+
 	// Modify only the user parameter, keep all others
 	startupMsg.Parameters["user"] = backendConfig.User
 
@@ -432,51 +448,39 @@ func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, ser
 			}
 			continue
 		case *pgproto3.AuthenticationSASL:
-			// SASL authentication - forward to client
-			log.Printf("SASL authentication requested, mechanisms: %v", msg.AuthMechanisms)
-
+			// SASL authentication - forward server's mechanism list to client.
 			buf, _ := msg.Encode(nil)
-			log.Printf("Sending SASL auth to client, message length: %d bytes", len(buf))
-
-			n, err := clientConn.Write(buf)
-			if err != nil {
+			if _, err := clientConn.Write(buf); err != nil {
 				return fmt.Errorf("failed to send SASL auth to client: %w", err)
 			}
-			log.Printf("Wrote %d bytes to client", n)
 
-			// Get SASL initial response from client
-			log.Printf("Waiting for SASL response from client...")
-
-			clientConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-			rawBuf := make([]byte, 1024)
-			n, err = clientConn.Read(rawBuf)
-			clientConn.SetReadDeadline(time.Time{})
-
+			// Receive the client's SASLInitialResponse via the framed Backend
+			// rather than a raw Read. A single Read assumes one TCP segment
+			// equals one protocol message; that's not guaranteed and the
+			// resulting mis-framing would corrupt the proof bytes.
+			if err := clientBackend.SetAuthType(pgproto3.AuthTypeSASL); err != nil {
+				return fmt.Errorf("failed to set SASL auth type: %w", err)
+			}
+			clientMsg, err := clientBackend.Receive()
 			if err != nil {
-				return fmt.Errorf("failed to read from client: %w", err)
+				return fmt.Errorf("failed to receive SASL initial response from client: %w", err)
+			}
+			initResp, ok := clientMsg.(*pgproto3.SASLInitialResponse)
+			if !ok {
+				return fmt.Errorf("unexpected client message during SASL init: %T", clientMsg)
+			}
+			buf, _ = initResp.Encode(nil)
+			if _, err := serverConn.Write(buf); err != nil {
+				return fmt.Errorf("failed to forward client SASL response: %w", err)
 			}
 
-			log.Printf("Raw message from client (%d bytes): %x", n, rawBuf[:n])
-
-			// Forward the client's SASL initial response to backend
-			log.Printf("Forwarding client SASL response to backend server")
-
-			_, err = serverConn.Write(rawBuf[:n])
-			if err != nil {
-				return fmt.Errorf("failed to forward client response: %w", err)
-			}
-
-			// Handle the rest of the SASL handshake
+			// Handle the rest of the SASL handshake.
 			for {
-				// Read response from server
 				serverMsg, err := serverFrontend.Receive()
 				if err != nil {
 					return fmt.Errorf("failed to receive from server during SASL: %w", err)
 				}
 
-				log.Printf("Received from server during SASL: %T", serverMsg)
-
-				// Forward to client
 				var buf []byte
 				switch msg := serverMsg.(type) {
 				case *pgproto3.AuthenticationSASLContinue:
@@ -486,40 +490,37 @@ func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, ser
 				case *pgproto3.AuthenticationOk:
 					buf, _ = msg.Encode(nil)
 					clientConn.Write(buf)
-					log.Printf("SASL authentication completed successfully")
-					return nil // Auth complete, exit this function
+					return nil
 				case *pgproto3.ErrorResponse:
 					buf, _ = msg.Encode(nil)
 					clientConn.Write(buf)
 					return fmt.Errorf("server auth error: %s", msg.Message)
 				default:
-					// Forward any other message types
 					if encoder, ok := msg.(interface{ Encode([]byte) ([]byte, error) }); ok {
 						buf, _ = encoder.Encode(nil)
 					}
 				}
 
 				if buf != nil {
-					_, err = clientConn.Write(buf)
-					if err != nil {
+					if _, err := clientConn.Write(buf); err != nil {
 						return fmt.Errorf("failed to forward server message to client: %w", err)
 					}
 				}
 
-				// If it was SASL Continue, read client's response
 				if _, ok := serverMsg.(*pgproto3.AuthenticationSASLContinue); ok {
-					// Read client's SASL response
-					clientBuf := make([]byte, 4096)
-					n, err := clientConn.Read(clientBuf)
+					if err := clientBackend.SetAuthType(pgproto3.AuthTypeSASLContinue); err != nil {
+						return fmt.Errorf("failed to set SASL continue auth type: %w", err)
+					}
+					contMsg, err := clientBackend.Receive()
 					if err != nil {
 						return fmt.Errorf("failed to read SASL response from client: %w", err)
 					}
-
-					log.Printf("Forwarding client SASL continue response (%d bytes) to server", n)
-
-					// Forward to server
-					_, err = serverConn.Write(clientBuf[:n])
-					if err != nil {
+					saslResp, ok := contMsg.(*pgproto3.SASLResponse)
+					if !ok {
+						return fmt.Errorf("unexpected client message during SASL continue: %T", contMsg)
+					}
+					buf, _ := saslResp.Encode(nil)
+					if _, err := serverConn.Write(buf); err != nil {
 						return fmt.Errorf("failed to forward client SASL response: %w", err)
 					}
 				}
@@ -706,6 +707,43 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 	case <-ctx.Done():
 		log.Println("Context cancelled, closing proxy connection")
 	}
+}
+
+// upgradeBackendToTLS performs the PostgreSQL SSLRequest handshake on an
+// existing backend connection and wraps it in a TLS client. Refuses to
+// proceed if the backend declines SSL ('N') or returns an error ('E') —
+// silent downgrade would defeat the point of using TLS here.
+func upgradeBackendToTLS(ctx context.Context, conn net.Conn, cfg *tls.Config) (net.Conn, error) {
+	// SSLRequest: int32 length (8) + int32 magic (80877103 = 0x04D2162F).
+	sslRequest := []byte{0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f}
+
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	defer conn.SetDeadline(time.Time{})
+
+	if _, err := conn.Write(sslRequest); err != nil {
+		return nil, fmt.Errorf("send SSLRequest: %w", err)
+	}
+
+	resp := make([]byte, 1)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, fmt.Errorf("read SSLRequest response: %w", err)
+	}
+	switch resp[0] {
+	case 'S':
+		// Backend agrees to TLS; proceed.
+	case 'N':
+		return nil, fmt.Errorf("backend refused SSL (responded 'N'); refusing to send credentials over plaintext")
+	case 'E':
+		return nil, fmt.Errorf("backend returned error in response to SSLRequest")
+	default:
+		return nil, fmt.Errorf("unexpected SSLRequest response byte: %q", resp[0])
+	}
+
+	tlsConn := tls.Client(conn, cfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, fmt.Errorf("backend TLS handshake: %w", err)
+	}
+	return tlsConn, nil
 }
 
 func isConnectionClosed(err error) bool {
