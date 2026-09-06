@@ -42,6 +42,7 @@ type (
 		listenAddr     string
 		router         Router
 		mu             sync.RWMutex
+		listener       net.Listener
 		tlsConfig      *TLSConfig
 		limits         *Limits
 		logger         *slog.Logger
@@ -175,6 +176,15 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 	}
 	defer listener.Close()
 
+	ps.mu.Lock()
+	ps.listener = listener
+	ps.mu.Unlock()
+	defer func() {
+		ps.mu.Lock()
+		ps.listener = nil
+		ps.mu.Unlock()
+	}()
+
 	sem := make(chan struct{}, ps.maxConnections())
 
 	ps.log().Info("proxy listening",
@@ -191,6 +201,13 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// A closed listener is terminal: retrying it spins the loop at
+			// full tilt, one log line per iteration, until the process dies.
+			// Check this before ctx, because the listener can be closed
+			// without the context being cancelled.
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			select {
 			case <-ctx.Done():
 				return nil
