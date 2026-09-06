@@ -3,10 +3,12 @@ package pgmux
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -52,19 +54,37 @@ type (
 
 	// ProxyServer is a PostgreSQL proxy server that routes connections based on username
 	ProxyServer struct {
-		listenAddr string
-		router     Router
-		pools      map[string]*ConnectionPool
-		mu         sync.RWMutex
-		tlsConfig  *TLSConfig
-		limits     *Limits
+		listenAddr     string
+		router         Router
+		pools          map[string]*ConnectionPool
+		mu             sync.RWMutex
+		tlsConfig      *TLSConfig
+		limits         *Limits
+		logger         *slog.Logger
+		startupRewrite StartupRewriteFunc
+		resolvedTLS    *tls.Config
 	}
+
+	// StartupRewriteFunc may mutate the startup parameters sent to the backend.
+	// It runs after routing and the user/database rewrites, immediately before
+	// the StartupMessage is encoded. pgmux ships no policy of its own here.
+	StartupRewriteFunc func(clientAddr net.Addr, params map[string]string)
+)
+
+// Client-visible failure messages are fixed strings: a wrapped Go error would
+// leak the backend host, port and topology. Detail goes to the log.
+const (
+	msgBackendUnavailable = "backend unavailable"
+	msgNotAuthorized      = "no backend available for this connection"
 )
 
 const (
 	defaultMaxConnections = 1024
 	defaultMaxMessageSize = 16 * 1024 * 1024
 	tlsHandshakeTimeout   = 10 * time.Second
+	// startupTimeout bounds how long a connection may occupy a slot without
+	// sending its StartupMessage.
+	startupTimeout = 10 * time.Second
 )
 
 // cappedChunkReader rejects Next(n) when n exceeds max, before pgproto3
@@ -94,7 +114,10 @@ func NewProxyServer(listenAddr string, router Router) *ProxyServer {
 	}
 }
 
-// WithTLS configures TLS support for the proxy server
+// WithTLS configures TLS support for the proxy server.
+//
+// All With… setters must be called before Start: they write fields the accept
+// loop reads without synchronisation.
 func (ps *ProxyServer) WithTLS(config *TLSConfig) *ProxyServer {
 	ps.tlsConfig = config
 	return ps
@@ -104,6 +127,28 @@ func (ps *ProxyServer) WithTLS(config *TLSConfig) *ProxyServer {
 func (ps *ProxyServer) WithLimits(limits *Limits) *ProxyServer {
 	ps.limits = limits
 	return ps
+}
+
+// WithLogger sets the structured logger. Defaults to slog.Default().
+// Per-connection detail (startup parameters, protocol chatter) is logged at
+// debug level; enable it with a handler whose level is slog.LevelDebug.
+func (ps *ProxyServer) WithLogger(logger *slog.Logger) *ProxyServer {
+	ps.logger = logger
+	return ps
+}
+
+// WithStartupRewrite installs a hook that may mutate the startup parameters
+// forwarded to the backend. Nil (the default) is a no-op.
+func (ps *ProxyServer) WithStartupRewrite(fn StartupRewriteFunc) *ProxyServer {
+	ps.startupRewrite = fn
+	return ps
+}
+
+func (ps *ProxyServer) log() *slog.Logger {
+	if ps.logger != nil {
+		return ps.logger
+	}
+	return slog.Default()
 }
 
 func (ps *ProxyServer) maxConnections() int {
@@ -129,6 +174,16 @@ func (ps *ProxyServer) clientIdleTimeout() time.Duration {
 
 // Start starts the proxy server and listens for connections
 func (ps *ProxyServer) Start(ctx context.Context) error {
+	// Resolve TLS once, at startup, so a bad path fails here rather than on
+	// the first client connection.
+	if ps.tlsConfig != nil && ps.tlsConfig.Enabled {
+		resolved, err := resolveServerTLS(ps.tlsConfig)
+		if err != nil {
+			return err
+		}
+		ps.resolvedTLS = resolved
+	}
+
 	// Always start with a plain TCP listener
 	// TLS upgrade happens after SSL negotiation
 	listener, err := net.Listen("tcp", ps.listenAddr)
@@ -139,11 +194,10 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 
 	sem := make(chan struct{}, ps.maxConnections())
 
-	tlsSuffix := ""
-	if ps.tlsConfig != nil && ps.tlsConfig.Enabled {
-		tlsSuffix = " (TLS available)"
-	}
-	log.Printf("PostgreSQL proxy listening on %s%s (max connections: %d)", ps.listenAddr, tlsSuffix, cap(sem))
+	ps.log().Info("proxy listening",
+		"addr", ps.listenAddr,
+		"tls", ps.resolvedTLS != nil,
+		"max_connections", cap(sem))
 
 	// Close listener when context is cancelled
 	go func() {
@@ -158,26 +212,95 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				return nil
 			default:
-				log.Printf("Failed to accept connection: %v", err)
+				ps.log().Error("failed to accept connection", "error", err)
 				continue
 			}
 		}
 
 		select {
 		case sem <- struct{}{}:
+			// Logged only on the accepted path, so counting these lines gives
+			// the connection count even when the cap is being hit.
+			ps.log().Info("connection accepted", "client", conn.RemoteAddr().String())
 			go func() {
 				defer func() { <-sem }()
+				defer ps.recoverConn(conn.RemoteAddr())
 				ps.handleConnection(ctx, conn)
 			}()
 		default:
-			ps.rejectOverCapacity(conn)
+			// In a goroutine so a client that stops reading cannot stall the
+			// accept loop.
+			go func() {
+				defer ps.recoverConn(conn.RemoteAddr())
+				ps.rejectOverCapacity(conn)
+			}()
 		}
 	}
 }
 
+// recoverConn keeps one malformed connection from taking the process down.
+// Every per-connection goroutine defers this.
+func (ps *ProxyServer) recoverConn(addr net.Addr) {
+	if r := recover(); r != nil {
+		ps.log().Error("panic handling connection",
+			"client", addrString(addr),
+			"panic", fmt.Sprint(r),
+			"stack", string(debug.Stack()))
+	}
+}
+
+func addrString(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return addr.String()
+}
+
+// resolveServerTLS turns a TLSConfig into the *tls.Config used for every client
+// handshake, failing if it cannot produce a usable one.
+func resolveServerTLS(cfg *TLSConfig) (*tls.Config, error) {
+	if cfg.Config != nil {
+		return cfg.Config, nil
+	}
+	if cfg.CertFile == "" || cfg.KeyFile == "" {
+		return nil, errors.New("TLS enabled but no certificates provided")
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load TLS keypair: %w", err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+}
+
+// sanitizeAuthError strips a backend ErrorResponse down to the fields a client
+// legitimately needs during authentication: PostgreSQL populates Detail, Hint,
+// Where, File, Line and Routine with server internals. Applies pre-auth only;
+// once a session is established, query errors are relayed intact.
+func sanitizeAuthError(msg *pgproto3.ErrorResponse) *pgproto3.ErrorResponse {
+	return &pgproto3.ErrorResponse{
+		Severity: msg.Severity,
+		Code:     msg.Code,
+		Message:  msg.Message,
+	}
+}
+
+// sendFatal writes a FATAL ErrorResponse to the client. The message must be a
+// fixed string, never a wrapped error: see msgBackendUnavailable.
+func (ps *ProxyServer) sendFatal(conn net.Conn, code, message string) {
+	errorMsg := &pgproto3.ErrorResponse{
+		Severity: "FATAL",
+		Code:     code,
+		Message:  message,
+	}
+	buf, _ := errorMsg.Encode(nil)
+	conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+	_, _ = conn.Write(buf)
+	conn.SetWriteDeadline(time.Time{})
+}
+
 func (ps *ProxyServer) rejectOverCapacity(conn net.Conn) {
 	defer conn.Close()
-	log.Printf("Rejecting connection from %s: at max connections", conn.RemoteAddr())
+	ps.log().Warn("rejecting connection: at max connections", "client", addrString(conn.RemoteAddr()))
 	errorMsg := &pgproto3.ErrorResponse{
 		Severity: "FATAL",
 		Code:     "53300",
@@ -193,90 +316,102 @@ func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn
 
 	backend := pgproto3.NewBackend(ps.newClientChunkReader(clientConn), clientConn)
 
+	clientConn.SetReadDeadline(time.Now().Add(startupTimeout))
 	startupMsg, err := backend.ReceiveStartupMessage()
 	if err != nil {
-		log.Printf("Failed to receive startup message: %v", err)
+		ps.log().Debug("failed to receive startup message", "client", addrString(clientConn.RemoteAddr()), "error", err)
 		return
 	}
 
-	log.Printf("Received startup message type: %T", startupMsg)
+	ps.log().Debug("startup message type", "client", addrString(clientConn.RemoteAddr()), "type", fmt.Sprintf("%T", startupMsg))
 
 	switch msg := startupMsg.(type) {
 	case *pgproto3.StartupMessage:
-		log.Printf("Protocol version: %d.%d", msg.ProtocolVersion>>16, msg.ProtocolVersion&0xFFFF)
+		clientConn.SetReadDeadline(time.Time{})
+		ps.log().Debug("protocol version", "major", msg.ProtocolVersion>>16, "minor", msg.ProtocolVersion&0xFFFF)
 		ps.handleStartupMessage(ctx, backend, msg, clientConn)
 	case *pgproto3.SSLRequest:
-		// Handle SSL negotiation
-		if ps.tlsConfig != nil && ps.tlsConfig.Enabled {
-			// Send 'S' to indicate SSL is supported
-			_, err := clientConn.Write([]byte{'S'})
-			if err != nil {
-				log.Printf("Failed to send SSL response: %v", err)
-				return
-			}
-
-			// Upgrade connection to TLS
-			var tlsConfig *tls.Config
-			if ps.tlsConfig.Config != nil {
-				tlsConfig = ps.tlsConfig.Config
-			} else if ps.tlsConfig.CertFile != "" && ps.tlsConfig.KeyFile != "" {
-				cert, err := tls.LoadX509KeyPair(ps.tlsConfig.CertFile, ps.tlsConfig.KeyFile)
-				if err != nil {
-					log.Printf("Failed to load TLS certificates: %v", err)
-					return
-				}
-				tlsConfig = &tls.Config{
-					Certificates: []tls.Certificate{cert},
-				}
-			} else {
-				log.Printf("TLS enabled but no certificates configured")
-				return
-			}
-
-			tlsConn := tls.Server(clientConn, tlsConfig)
-			clientConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
-			if err := tlsConn.Handshake(); err != nil {
-				log.Printf("TLS handshake failed: %v", err)
-				return
-			}
-			clientConn.SetDeadline(time.Time{})
-
-			log.Printf("TLS connection established")
-
-			// Create new backend with TLS connection
-			tlsBackend := pgproto3.NewBackend(ps.newClientChunkReader(tlsConn), tlsConn)
-
-			// Receive the actual startup message over TLS
-			startupMsg, err := tlsBackend.ReceiveStartupMessage()
-			if err != nil {
-				log.Printf("Failed to receive startup message after TLS: %v", err)
-				return
-			}
-
-			if sm, ok := startupMsg.(*pgproto3.StartupMessage); ok {
-				ps.handleStartupMessage(ctx, tlsBackend, sm, tlsConn)
-			}
-		} else {
-			// TLS not configured, respond with 'N'
-			_, err := clientConn.Write([]byte{'N'})
-			if err != nil {
-				log.Printf("Failed to send SSL response: %v", err)
-				return
-			}
-
-			// Continue to receive the actual startup message without TLS
-			startupMsg, err := backend.ReceiveStartupMessage()
-			if err != nil {
-				log.Printf("Failed to receive startup message after SSL: %v", err)
-				return
-			}
-
-			if sm, ok := startupMsg.(*pgproto3.StartupMessage); ok {
-				ps.handleStartupMessage(ctx, backend, sm, clientConn)
-			}
+		ps.handleSSLRequest(ctx, backend, clientConn)
+	case *pgproto3.GSSEncRequest:
+		// libpq sends GSSENCRequest before SSLRequest when gssencmode is prefer
+		// (the default) and the client holds Kerberos credentials. Decline it
+		// and read the client's next packet, same as the SSL path.
+		if _, err := clientConn.Write([]byte{'N'}); err != nil {
+			ps.log().Debug("failed to decline GSS encryption",
+				"client", addrString(clientConn.RemoteAddr()), "error", err)
+			return
+		}
+		clientConn.SetReadDeadline(time.Now().Add(startupTimeout))
+		next, err := backend.ReceiveStartupMessage()
+		if err != nil {
+			ps.log().Debug("failed to receive startup message after GSS declined",
+				"client", addrString(clientConn.RemoteAddr()), "error", err)
+			return
+		}
+		clientConn.SetReadDeadline(time.Time{})
+		switch nm := next.(type) {
+		case *pgproto3.StartupMessage:
+			ps.handleStartupMessage(ctx, backend, nm, clientConn)
+		case *pgproto3.SSLRequest:
+			ps.handleSSLRequest(ctx, backend, clientConn)
+		default:
+			ps.log().Debug("unexpected startup message after GSS declined",
+				"client", addrString(clientConn.RemoteAddr()), "type", fmt.Sprintf("%T", nm))
 		}
 	default:
-		log.Printf("Unexpected startup message type: %T", msg)
+		ps.log().Debug("unexpected startup message type", "client", addrString(clientConn.RemoteAddr()), "type", fmt.Sprintf("%T", msg))
+	}
+}
+
+// handleSSLRequest performs PostgreSQL SSL negotiation and then reads the real
+// StartupMessage, over TLS if the upgrade happened.
+func (ps *ProxyServer) handleSSLRequest(ctx context.Context, backend *pgproto3.Backend, clientConn net.Conn) {
+	client := addrString(clientConn.RemoteAddr())
+
+	if ps.resolvedTLS == nil {
+		// TLS not configured: decline and continue in cleartext.
+		if _, err := clientConn.Write([]byte{'N'}); err != nil {
+			ps.log().Debug("failed to send SSL negotiation response", "client", client, "error", err)
+			return
+		}
+		clientConn.SetReadDeadline(time.Now().Add(startupTimeout))
+		startupMsg, err := backend.ReceiveStartupMessage()
+		if err != nil {
+			ps.log().Debug("failed to receive startup message after SSL negotiation", "client", client, "error", err)
+			return
+		}
+		clientConn.SetReadDeadline(time.Time{})
+		if sm, ok := startupMsg.(*pgproto3.StartupMessage); ok {
+			ps.handleStartupMessage(ctx, backend, sm, clientConn)
+		}
+		return
+	}
+
+	if _, err := clientConn.Write([]byte{'S'}); err != nil {
+		ps.log().Debug("failed to send SSL negotiation response", "client", client, "error", err)
+		return
+	}
+
+	tlsConn := tls.Server(clientConn, ps.resolvedTLS)
+	clientConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
+	if err := tlsConn.Handshake(); err != nil {
+		ps.log().Debug("TLS handshake failed", "client", client, "error", err)
+		return
+	}
+	clientConn.SetDeadline(time.Time{})
+	ps.log().Debug("TLS connection established", "client", client)
+
+	tlsBackend := pgproto3.NewBackend(ps.newClientChunkReader(tlsConn), tlsConn)
+	tlsConn.SetReadDeadline(time.Now().Add(startupTimeout))
+	startupMsg, err := tlsBackend.ReceiveStartupMessage()
+	if err != nil {
+		ps.log().Debug("failed to receive startup message after TLS", "client", client, "error", err)
+		return
+	}
+	tlsConn.SetReadDeadline(time.Time{})
+
+	if sm, ok := startupMsg.(*pgproto3.StartupMessage); ok {
+		ps.handleStartupMessage(ctx, tlsBackend, sm, tlsConn)
 	}
 }
 
@@ -284,34 +419,32 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 	startupMsg *pgproto3.StartupMessage, clientConn net.Conn,
 ) {
 	originalUser := startupMsg.Parameters["user"]
-	log.Printf("New connection for user: %s", originalUser)
-	log.Printf("Startup parameters: %+v", startupMsg.Parameters)
+	clientAddr := clientConn.RemoteAddr()
+
+	// Startup parameters are attacker-supplied on a public endpoint; keep them
+	// out of the default log stream.
+	ps.log().Debug("startup message received", "client", addrString(clientAddr),
+		"user", originalUser,
+		"parameters", fmt.Sprintf("%+v", startupMsg.Parameters))
 
 	// Route the user to get backend configuration
 	backendConfig, err := ps.router.Route(ctx, originalUser)
 	if err != nil {
-		var errorMsg *pgproto3.ErrorResponse
-		if err == ErrUserNotFound {
-			errorMsg = &pgproto3.ErrorResponse{
-				Severity: "FATAL",
-				Code:     "28P01",
-				Message:  fmt.Sprintf("User mapping not found for: %s", originalUser),
-			}
-		} else {
-			errorMsg = &pgproto3.ErrorResponse{
-				Severity: "FATAL",
-				Code:     "08001",
-				Message:  fmt.Sprintf("Routing error: %v", err),
-			}
+		// Do not echo the username or routing error back: one confirms which
+		// usernames exist, the other describes the topology.
+		code, msg := "08001", msgBackendUnavailable
+		if errors.Is(err, ErrUserNotFound) {
+			code, msg = "28P01", msgNotAuthorized
 		}
-		buf, _ := errorMsg.Encode(nil)
-		clientConn.Write(buf)
+		ps.log().Warn("routing failed",
+			"client", addrString(clientAddr), "user", originalUser, "error", err)
+		ps.sendFatal(clientConn, code, msg)
 		return
 	}
 
 	// Create new connection for authentication (with retries for port changes)
 	addr := net.JoinHostPort(backendConfig.Host, strconv.Itoa(backendConfig.Port))
-	log.Printf("Connecting to backend %s as user %s", addr, backendConfig.User)
+	ps.log().Debug("connecting to backend", "backend", addr, "backend_user", backendConfig.User)
 
 	var backendConn net.Conn
 	maxRetries := 3
@@ -324,23 +457,20 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 				break
 			}
 			addr = net.JoinHostPort(backendConfig.Host, strconv.Itoa(backendConfig.Port))
-			log.Printf("Retrying backend connection (attempt %d) to %s", attempt+1, addr)
+			ps.log().Debug("retrying backend connection", "attempt", attempt+1, "backend", addr)
 		}
 		dialer := net.Dialer{Timeout: 5 * time.Second}
 		backendConn, err = dialer.DialContext(ctx, "tcp", addr)
 		if err == nil {
 			break
 		}
-		log.Printf("Backend dial failed (attempt %d/%d): %v", attempt+1, maxRetries, err)
+		ps.log().Warn("backend dial attempt failed", "attempt", attempt+1, "max_attempts", maxRetries, "error", err)
 	}
 	if err != nil {
-		errorMsg := &pgproto3.ErrorResponse{
-			Severity: "FATAL",
-			Code:     "08001",
-			Message:  fmt.Sprintf("Could not connect to backend: %v", err),
-		}
-		buf, _ := errorMsg.Encode(nil)
-		clientConn.Write(buf)
+		// The dial error names the backend host and port: log it, do not send it.
+		ps.log().Error("backend dial failed",
+			"client", addrString(clientAddr), "user", originalUser, "error", err)
+		ps.sendFatal(clientConn, "08001", msgBackendUnavailable)
 		return
 	}
 	defer backendConn.Close()
@@ -348,38 +478,47 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 	if backendConfig.TLS != nil {
 		upgraded, err := upgradeBackendToTLS(ctx, backendConn, backendConfig.TLS)
 		if err != nil {
-			log.Printf("Backend TLS negotiation failed: %v", err)
-			errorMsg := &pgproto3.ErrorResponse{
-				Severity: "FATAL",
-				Code:     "08001",
-				Message:  fmt.Sprintf("Backend TLS negotiation failed: %v", err),
-			}
-			buf, _ := errorMsg.Encode(nil)
-			clientConn.Write(buf)
+			ps.log().Error("backend TLS negotiation failed",
+				"client", addrString(clientAddr), "error", err)
+			ps.sendFatal(clientConn, "08001", msgBackendUnavailable)
 			return
 		}
 		backendConn = upgraded
 	}
 
-	// Modify only the user parameter, keep all others
+	// Rewrite the identity parameters, keep all others.
 	startupMsg.Parameters["user"] = backendConfig.User
+	if backendConfig.Database != "" {
+		startupMsg.Parameters["database"] = backendConfig.Database
+	}
+
+	if ps.startupRewrite != nil {
+		ps.startupRewrite(clientAddr, startupMsg.Parameters)
+	}
 
 	serverFrontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(backendConn), backendConn)
 
 	buf, _ := startupMsg.Encode(nil)
-	log.Printf("Sending startup message to backend with parameters: %+v", startupMsg.Parameters)
+	ps.log().Debug("forwarding startup message to backend",
+		"client", addrString(clientAddr),
+		"parameters", fmt.Sprintf("%+v", startupMsg.Parameters))
 	_, err = backendConn.Write(buf)
 	if err != nil {
-		log.Printf("Failed to send startup message to backend: %v", err)
+		ps.log().Error("failed to send startup message to backend",
+			"client", addrString(clientAddr), "error", err)
+		ps.sendFatal(clientConn, "08001", msgBackendUnavailable)
 		return
 	}
 
 	if err := ps.handleAuthentication(clientBackend, serverFrontend, clientConn, backendConn); err != nil {
-		log.Printf("Authentication failed: %v", err)
+		ps.log().Warn("authentication failed", "client", addrString(clientAddr), "user", originalUser, "error", err)
 		return
 	}
 
-	log.Printf("Authentication successful for user %s", originalUser)
+	// Debug, not Info: "connection accepted" is the single per-connection
+	// record at default level.
+	ps.log().Debug("authentication successful",
+		"client", addrString(clientAddr), "user", originalUser, "backend_user", backendConfig.User)
 	ps.proxyMessages(ctx, clientBackend, serverFrontend, clientConn, backendConn)
 }
 
@@ -400,12 +539,12 @@ func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, ser
 			return fmt.Errorf("failed to receive from backend: %w", err)
 		}
 
-		log.Printf("Received auth message from backend: %T", msg)
+		ps.log().Debug("auth message from backend", "type", fmt.Sprintf("%T", msg))
 
 		var buf []byte
 		switch msg := msg.(type) {
 		case *pgproto3.AuthenticationOk:
-			log.Printf("Authentication OK received")
+			ps.log().Debug("authentication OK received")
 			buf, _ = msg.Encode(nil)
 		case *pgproto3.AuthenticationCleartextPassword:
 			buf, _ = msg.Encode(nil)
@@ -492,7 +631,10 @@ func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, ser
 					clientConn.Write(buf)
 					return nil
 				case *pgproto3.ErrorResponse:
-					buf, _ = msg.Encode(nil)
+					ps.log().Warn("backend rejected authentication",
+						"code", msg.Code, "message", msg.Message,
+						"detail", msg.Detail, "where", msg.Where)
+					buf, _ = sanitizeAuthError(msg).Encode(nil)
 					clientConn.Write(buf)
 					return fmt.Errorf("server auth error: %s", msg.Message)
 				default:
@@ -537,14 +679,17 @@ func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, ser
 			}
 			return nil
 		case *pgproto3.ErrorResponse:
-			buf, _ = msg.Encode(nil)
+			ps.log().Warn("backend rejected authentication",
+				"code", msg.Code, "message", msg.Message,
+				"detail", msg.Detail, "where", msg.Where)
+			buf, _ = sanitizeAuthError(msg).Encode(nil)
 			_, err = clientConn.Write(buf)
 			if err != nil {
 				return fmt.Errorf("failed to send error to client: %w", err)
 			}
 			return fmt.Errorf("authentication error: %s", msg.Message)
 		default:
-			log.Printf("Unexpected auth message type: %T", msg)
+			ps.log().Debug("unexpected auth message type", "type", fmt.Sprintf("%T", msg))
 			continue
 		}
 
@@ -566,6 +711,12 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 
 	// Client to server
 	go func() {
+		// Always signal on exit: returning silently would leave the opposite
+		// goroutine parked in Receive and the select below blocked forever,
+		// leaking the connection slot.
+		var err error
+		defer func() { errChan <- err }()
+		defer ps.recoverConn(clientConn.RemoteAddr())
 		for {
 			select {
 			case <-ctx.Done():
@@ -574,11 +725,10 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 				if idle > 0 {
 					clientConn.SetReadDeadline(time.Now().Add(idle))
 				}
-				msg, err := clientBackend.Receive()
+				var msg pgproto3.FrontendMessage
+				msg, err = clientBackend.Receive()
 				if err != nil {
-					if err != io.EOF && !isConnectionClosed(err) {
-						errChan <- fmt.Errorf("client receive: %w", err)
-					}
+					err = fmt.Errorf("client receive: %w", err)
 					return
 				}
 
@@ -609,14 +759,13 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 				case *pgproto3.Flush:
 					buf, _ = m.Encode(nil)
 				default:
-					log.Printf("Unknown client message type: %T", m)
+					ps.log().Debug("unknown client message type", "type", fmt.Sprintf("%T", m))
 					continue
 				}
 
 				if buf != nil {
-					_, err = serverConn.Write(buf)
-					if err != nil {
-						errChan <- fmt.Errorf("server send: %w", err)
+					if _, err = serverConn.Write(buf); err != nil {
+						err = fmt.Errorf("server send: %w", err)
 						return
 					}
 				}
@@ -626,16 +775,18 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 
 	// Server to client
 	go func() {
+		var err error
+		defer func() { errChan <- err }()
+		defer ps.recoverConn(serverConn.RemoteAddr())
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				msg, err := serverFrontend.Receive()
+				var msg pgproto3.BackendMessage
+				msg, err = serverFrontend.Receive()
 				if err != nil {
-					if err != io.EOF && !isConnectionClosed(err) {
-						errChan <- fmt.Errorf("server receive: %w", err)
-					}
+					err = fmt.Errorf("server receive: %w", err)
 					return
 				}
 
@@ -684,14 +835,13 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 				case *pgproto3.PortalSuspended:
 					buf, _ = m.Encode(nil)
 				default:
-					log.Printf("Unknown server message type: %T", m)
+					ps.log().Debug("unknown server message type", "type", fmt.Sprintf("%T", m))
 					continue
 				}
 
 				if buf != nil {
-					_, err = clientConn.Write(buf)
-					if err != nil {
-						errChan <- fmt.Errorf("client send: %w", err)
+					if _, err = clientConn.Write(buf); err != nil {
+						err = fmt.Errorf("client send: %w", err)
 						return
 					}
 				}
@@ -699,13 +849,21 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 		}
 	}()
 
+	// Returning runs the caller's deferred Close on both connections, which
+	// unblocks whichever direction is still in Receive.
 	select {
 	case err := <-errChan:
-		if err != nil {
-			log.Printf("Proxy error: %v", err)
+		switch {
+		case err == nil:
+			ps.log().Debug("proxy session ended")
+		case isConnectionClosed(err) || errors.Is(err, io.ErrUnexpectedEOF):
+			// Ordinary hang-ups: EOF, reset, or an idle-timeout deadline.
+			ps.log().Debug("proxy session closed", "reason", err)
+		default:
+			ps.log().Warn("proxy session ended with error", "error", err)
 		}
 	case <-ctx.Done():
-		log.Println("Context cancelled, closing proxy connection")
+		ps.log().Debug("context cancelled, closing proxy connection")
 	}
 }
 
@@ -750,5 +908,11 @@ func isConnectionClosed(err error) bool {
 	if netErr, ok := err.(*net.OpError); ok {
 		return netErr.Op == "read" || netErr.Op == "write"
 	}
-	return false
+	// Errors reach us wrapped by fmt.Errorf, and tls.Conn wraps read failures
+	// in its own permanentError, so the bare type assertion above is not enough.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return opErr.Op == "read" || opErr.Op == "write"
+	}
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF)
 }

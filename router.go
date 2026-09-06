@@ -10,11 +10,21 @@ import (
 var ErrUserNotFound = errors.New("user mapping not found")
 
 type (
-	// BackendConfig represents the configuration for a backend PostgreSQL server
+	// BackendConfig represents the configuration for a backend PostgreSQL server.
+	//
+	// Treat it as immutable once handed to a Router: the same pointer may be
+	// returned to many concurrent connections.
 	BackendConfig struct {
 		Host string
 		Port int
 		User string
+		// Database, when non-empty, replaces the client's requested database
+		// in the StartupMessage. Empty passes the client's value through.
+		//
+		// libpq defaults dbname to the client's OS username when -d is omitted,
+		// so a public endpoint that wants every visitor in one database must
+		// set this.
+		Database string
 		// TLS, when non-nil, makes pgmux issue a PostgreSQL SSLRequest before
 		// the StartupMessage and upgrade the backend connection to TLS using
 		// this config. If the backend refuses SSL, the connection is rejected
