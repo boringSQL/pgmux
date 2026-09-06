@@ -15,15 +15,19 @@ func TestResolveServerTLSCombinesConfigAndCertFiles(t *testing.T) {
 		CertFile: certFile,
 		KeyFile:  keyFile,
 		Config:   &tls.Config{MinVersion: tls.VersionTLS13},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("resolveServerTLS: %v", err)
 	}
 	if resolved.MinVersion != tls.VersionTLS13 {
 		t.Errorf("MinVersion = %#x, want TLS 1.3 from Config", resolved.MinVersion)
 	}
-	if len(resolved.Certificates) != 1 {
-		t.Errorf("got %d certificates, want the keypair loaded from CertFile", len(resolved.Certificates))
+	// Files are served through GetCertificate so renewals are picked up.
+	if resolved.GetCertificate == nil {
+		t.Error("no GetCertificate for a keypair loaded from CertFile")
+	}
+	if _, err := resolved.GetCertificate(&tls.ClientHelloInfo{}); err != nil {
+		t.Errorf("GetCertificate: %v", err)
 	}
 }
 
@@ -39,7 +43,7 @@ func TestResolveServerTLSKeepsConfigCertificates(t *testing.T) {
 	resolved, err := resolveServerTLS(&TLSConfig{
 		Enabled: true,
 		Config:  &tls.Config{Certificates: []tls.Certificate{cert}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("resolveServerTLS: %v", err)
 	}
@@ -56,7 +60,7 @@ func TestResolveServerTLSDoesNotMutateCallerConfig(t *testing.T) {
 
 	if _, err := resolveServerTLS(&TLSConfig{
 		Enabled: true, CertFile: certFile, KeyFile: keyFile, Config: caller,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("resolveServerTLS: %v", err)
 	}
 	if len(caller.Certificates) != 0 {
@@ -70,7 +74,7 @@ func TestResolveServerTLSRejectsConfigWithoutCertificates(t *testing.T) {
 	_, err := resolveServerTLS(&TLSConfig{
 		Enabled: true,
 		Config:  &tls.Config{MinVersion: tls.VersionTLS13},
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("resolveServerTLS accepted a Config with no certificates")
 	}

@@ -31,7 +31,7 @@ type (
 		Required bool
 		// Config supplies advanced settings such as MinVersion. It is cloned,
 		// not adopted. Certificates are loaded from CertFile/KeyFile unless it
-		// already carries them.
+		// already carries them, and reloaded when those files change.
 		Config *tls.Config
 	}
 
@@ -193,7 +193,7 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 	// Resolve TLS once, at startup, so a bad path fails here rather than on
 	// the first client connection.
 	if ps.tlsConfig != nil && ps.tlsConfig.Enabled {
-		resolved, err := resolveServerTLS(ps.tlsConfig)
+		resolved, err := resolveServerTLS(ps.tlsConfig, ps.log())
 		if err != nil {
 			return err
 		}
@@ -456,7 +456,7 @@ func addrString(addr net.Addr) string {
 
 // resolveServerTLS turns a TLSConfig into the *tls.Config used for every client
 // handshake, failing if it cannot produce a usable one.
-func resolveServerTLS(cfg *TLSConfig) (*tls.Config, error) {
+func resolveServerTLS(cfg *TLSConfig, logger *slog.Logger) (*tls.Config, error) {
 	// Clone rather than adopt: the caller's config is theirs, and a *tls.Config
 	// handed to two servers must not pick up one server's certificates.
 	out := &tls.Config{}
@@ -468,15 +468,25 @@ func resolveServerTLS(cfg *TLSConfig) (*tls.Config, error) {
 	// otherwise, so settings like MinVersion no longer cost the caller the
 	// CertFile/KeyFile convenience — previously Config was returned verbatim
 	// and the two were mutually exclusive.
+	if len(out.Certificates) > 0 && cfg.CertFile != "" && logger != nil {
+		// Certificates in Config win, so the files are never consulted again
+		// and a renewal would go unnoticed until the certificate expired.
+		logger.Warn("TLS certificates supplied in Config: CertFile and KeyFile are ignored and will not be reloaded",
+			"cert_file", cfg.CertFile)
+	}
+
 	if len(out.Certificates) == 0 && out.GetCertificate == nil {
 		if cfg.CertFile == "" || cfg.KeyFile == "" {
 			return nil, errors.New("TLS enabled but no certificates provided")
 		}
-		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		reloader, err := newCertReloader(cfg.CertFile, cfg.KeyFile, logger)
 		if err != nil {
-			return nil, fmt.Errorf("load TLS keypair: %w", err)
+			return nil, err
 		}
-		out.Certificates = []tls.Certificate{cert}
+		// GetCertificate only, never alongside Certificates: crypto/tls
+		// consults it only when Certificates is empty or the client sent SNI,
+		// so populating both would skip reloads for connections by IP.
+		out.GetCertificate = reloader.GetCertificate
 	}
 	return out, nil
 }

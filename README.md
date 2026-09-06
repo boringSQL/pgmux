@@ -310,9 +310,13 @@ claim in either direction, here is what has actually been done and what has not.
 - **Panic containment.** Every per-connection goroutine recovers — the handler
   and both relay directions — including around your `WithStartupRewrite` hook.
   One malformed connection cannot take the process down.
-- **TLS material is loaded once, at `Start`.** A bad certificate path fails
-  startup instead of every connection, and an unauthenticated client cannot
-  force a file read and key parse per connection.
+- **TLS material is validated at `Start`, and reloaded when it changes.** A bad
+  certificate path fails startup instead of every connection. `CertFile` and
+  `KeyFile` are re-read when their mtime or size changes, so a renewal takes
+  effect without a restart; a version that fails to load is reported once and
+  the previous certificate keeps serving. An unauthenticated client cannot
+  force a file read and key parse per connection: unchanged files, and a
+  broken version already reported, are served from memory.
 - **GSSAPI encryption requests are declined cleanly**, so `psql` works for
   visitors holding Kerberos credentials instead of failing with "server closed
   the connection unexpectedly".
