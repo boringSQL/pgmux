@@ -26,7 +26,9 @@ type (
 		CertFile string
 		// Path to key file
 		KeyFile string
-		// Optional TLS config for advanced settings
+		// Config supplies advanced settings such as MinVersion. It is cloned,
+		// not adopted. Certificates are loaded from CertFile/KeyFile unless it
+		// already carries them.
 		Config *tls.Config
 	}
 
@@ -443,17 +445,28 @@ func addrString(addr net.Addr) string {
 // resolveServerTLS turns a TLSConfig into the *tls.Config used for every client
 // handshake, failing if it cannot produce a usable one.
 func resolveServerTLS(cfg *TLSConfig) (*tls.Config, error) {
+	// Clone rather than adopt: the caller's config is theirs, and a *tls.Config
+	// handed to two servers must not pick up one server's certificates.
+	out := &tls.Config{}
 	if cfg.Config != nil {
-		return cfg.Config, nil
+		out = cfg.Config.Clone()
 	}
-	if cfg.CertFile == "" || cfg.KeyFile == "" {
-		return nil, errors.New("TLS enabled but no certificates provided")
+
+	// Certificates come from Config when it carries them and from the files
+	// otherwise, so settings like MinVersion no longer cost the caller the
+	// CertFile/KeyFile convenience — previously Config was returned verbatim
+	// and the two were mutually exclusive.
+	if len(out.Certificates) == 0 && out.GetCertificate == nil {
+		if cfg.CertFile == "" || cfg.KeyFile == "" {
+			return nil, errors.New("TLS enabled but no certificates provided")
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load TLS keypair: %w", err)
+		}
+		out.Certificates = []tls.Certificate{cert}
 	}
-	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load TLS keypair: %w", err)
-	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+	return out, nil
 }
 
 // sanitizeAuthError strips a backend ErrorResponse down to the fields a client
