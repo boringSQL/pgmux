@@ -26,6 +26,9 @@ type (
 		CertFile string
 		// Path to key file
 		KeyFile string
+		// Required rejects connections that are not under TLS. No effect
+		// unless Enabled is also set.
+		Required bool
 		// Config supplies advanced settings such as MinVersion. It is cloned,
 		// not adopted. Certificates are loaded from CertFile/KeyFile unless it
 		// already carries them.
@@ -79,6 +82,7 @@ type (
 const (
 	msgBackendUnavailable = "backend unavailable"
 	msgNotAuthorized      = "no backend available for this connection"
+	msgSSLRequired        = "SSL connection is required"
 )
 
 const (
@@ -159,6 +163,10 @@ func (ps *ProxyServer) log() *slog.Logger {
 	return slog.Default()
 }
 
+func (ps *ProxyServer) tlsRequired() bool {
+	return ps.tlsConfig != nil && ps.tlsConfig.Required
+}
+
 func (ps *ProxyServer) maxConnections() int {
 	if ps.limits != nil && ps.limits.MaxConnections > 0 {
 		return ps.limits.MaxConnections
@@ -190,6 +198,10 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 			return err
 		}
 		ps.resolvedTLS = resolved
+	}
+	// Requiring TLS without the means to serve it must not start.
+	if ps.tlsConfig != nil && ps.tlsConfig.Required && ps.resolvedTLS == nil {
+		return errors.New("TLS required but not enabled")
 	}
 
 	// Always start with a plain TCP listener
@@ -617,6 +629,17 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 ) {
 	originalUser := startupMsg.Parameters["user"]
 	clientAddr := clientConn.RemoteAddr()
+
+	// Check the connection's type, not the negotiation path: a
+	// StartupMessage can also arrive with no SSLRequest at all.
+	if ps.tlsRequired() {
+		if _, ok := clientConn.(*tls.Conn); !ok {
+			ps.log().Warn("rejecting plaintext connection",
+				"client", addrString(clientAddr))
+			ps.sendFatal(clientConn, "28000", msgSSLRequired)
+			return
+		}
+	}
 
 	// Startup parameters are attacker-supplied on a public endpoint; keep them
 	// out of the default log stream.
