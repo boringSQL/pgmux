@@ -43,6 +43,10 @@ type (
 		router         Router
 		mu             sync.RWMutex
 		listener       net.Listener
+		closing        chan struct{}
+		conns          map[net.Conn]struct{}
+		backendConns   map[net.Conn]struct{}
+		wg             sync.WaitGroup
 		tlsConfig      *TLSConfig
 		limits         *Limits
 		logger         *slog.Logger
@@ -70,6 +74,9 @@ const (
 	// startupTimeout bounds how long a connection may occupy a slot without
 	// sending its StartupMessage.
 	startupTimeout = 10 * time.Second
+	// forceCloseGrace bounds how long Shutdown waits for sessions to unwind
+	// after their connections have been closed.
+	forceCloseGrace = 2 * time.Second
 )
 
 // cappedChunkReader rejects Next(n) when n exceeds max, before pgproto3
@@ -93,8 +100,11 @@ func (ps *ProxyServer) newClientChunkReader(r io.Reader) pgproto3.ChunkReader {
 // NewProxyServer creates a new ProxyServer with the given listen address and router
 func NewProxyServer(listenAddr string, router Router) *ProxyServer {
 	return &ProxyServer{
-		listenAddr: listenAddr,
-		router:     router,
+		listenAddr:   listenAddr,
+		router:       router,
+		closing:      make(chan struct{}),
+		conns:        make(map[net.Conn]struct{}),
+		backendConns: make(map[net.Conn]struct{}),
 	}
 }
 
@@ -178,6 +188,13 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 
 	ps.mu.Lock()
 	ps.listener = listener
+	select {
+	case <-ps.closing:
+		// Shutdown already ran; serving now would accept-and-reject forever.
+		ps.mu.Unlock()
+		return nil
+	default:
+	}
 	ps.mu.Unlock()
 	defer func() {
 		ps.mu.Lock()
@@ -192,10 +209,14 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 		"tls", ps.resolvedTLS != nil,
 		"max_connections", cap(sem))
 
-	// Close listener when context is cancelled
+	// Also select on closing, or a Shutdown that never cancels ctx leaks
+	// this goroutine.
 	go func() {
-		<-ctx.Done()
-		listener.Close()
+		select {
+		case <-ctx.Done():
+			listener.Close()
+		case <-ps.closing:
+		}
 	}()
 
 	for {
@@ -219,11 +240,18 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 
 		select {
 		case sem <- struct{}{}:
+			// Must not start a session once Shutdown has stopped waiting.
+			if !ps.trackConn(conn) {
+				<-sem
+				conn.Close()
+				continue
+			}
 			// Logged only on the accepted path, so counting these lines gives
 			// the connection count even when the cap is being hit.
 			ps.log().Info("connection accepted", "client", conn.RemoteAddr().String())
 			go func() {
 				defer func() { <-sem }()
+				defer ps.untrackConn(conn)
 				defer ps.recoverConn(conn.RemoteAddr())
 				ps.handleConnection(ctx, conn)
 			}()
@@ -236,6 +264,117 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 			}()
 		}
 	}
+}
+
+// trackConn registers an accepted connection so Shutdown can wait for it and
+// close it past the drain deadline. It reports false once shutdown has begun:
+// wg.Add racing a zero-counter wg.Wait panics.
+//
+// The raw TCP conn is tracked, not the *tls.Conn wrapping it later — closing
+// the underlying connection is what unblocks a reader parked in the TLS layer.
+func (ps *ProxyServer) trackConn(conn net.Conn) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	select {
+	case <-ps.closing:
+		return false
+	default:
+	}
+
+	ps.conns[conn] = struct{}{}
+	ps.wg.Add(1)
+	return true
+}
+
+func (ps *ProxyServer) untrackConn(conn net.Conn) {
+	ps.mu.Lock()
+	delete(ps.conns, conn)
+	ps.mu.Unlock()
+	ps.wg.Done()
+}
+
+// trackBackendConn registers a dialed backend connection so a forced Shutdown
+// closes it too; it reports false once shutdown has begun, in which case the
+// caller must abandon the session. Not counted in wg — the session's client
+// connection already is.
+func (ps *ProxyServer) trackBackendConn(conn net.Conn) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	select {
+	case <-ps.closing:
+		return false
+	default:
+	}
+
+	ps.backendConns[conn] = struct{}{}
+	return true
+}
+
+func (ps *ProxyServer) untrackBackendConn(conn net.Conn) {
+	ps.mu.Lock()
+	delete(ps.backendConns, conn)
+	ps.mu.Unlock()
+}
+
+// forceCloseConns closes every live client and backend connection and reports
+// how many client sessions were open. Sessions parked in Receive ignore
+// context cancellation, so closing the connections under them is the only way
+// to end the wait — and closing only the client side would leave a session
+// parked in a backend write.
+func (ps *ProxyServer) forceCloseConns() int {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	n := len(ps.conns)
+	for conn := range ps.conns {
+		conn.Close()
+	}
+	for conn := range ps.backendConns {
+		conn.Close()
+	}
+	return n
+}
+
+// Shutdown stops accepting connections and waits for the open ones to finish,
+// up to ctx's deadline. Past the deadline the remaining connections are closed
+// under their sessions and an error naming how many were cut is returned; a
+// clean drain returns nil.
+//
+// Safe to call before Start, concurrently, or twice. Shutdown is terminal.
+func (ps *ProxyServer) Shutdown(ctx context.Context) error {
+	ps.mu.Lock()
+	select {
+	case <-ps.closing:
+		// Another caller is already draining; fall through and wait with them.
+	default:
+		close(ps.closing)
+	}
+	if ps.listener != nil {
+		// Ends the accept loop, which returns nil on net.ErrClosed.
+		ps.listener.Close()
+	}
+	ps.mu.Unlock()
+
+	drained := make(chan struct{})
+	go func() {
+		ps.wg.Wait()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+	}
+
+	n := ps.forceCloseConns()
+	select {
+	case <-drained:
+	case <-time.After(forceCloseGrace):
+	}
+	return fmt.Errorf("pgmux: drain deadline passed with %d connection(s) open: %w", n, ctx.Err())
 }
 
 // recoverConn keeps one malformed connection from taking the process down.
@@ -474,6 +613,13 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 		return
 	}
 	defer backendConn.Close()
+
+	// Registered after the dial loop, before TLS upgrade: the raw conn is the
+	// key either way, and a forced Shutdown must be able to close it.
+	if !ps.trackBackendConn(backendConn) {
+		return
+	}
+	defer ps.untrackBackendConn(backendConn)
 
 	if backendConfig.TLS != nil {
 		upgraded, err := upgradeBackendToTLS(ctx, backendConn, backendConfig.TLS)
