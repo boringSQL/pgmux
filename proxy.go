@@ -17,21 +17,6 @@ import (
 )
 
 type (
-	// ConnectionPool manages a pool of connections to a backend server
-	ConnectionPool struct {
-		mu          sync.Mutex
-		connections []*BackendConnection
-		maxSize     int
-		config      *BackendConfig
-	}
-
-	// BackendConnection represents a connection to a backend PostgreSQL server
-	BackendConnection struct {
-		conn     net.Conn
-		inUse    bool
-		lastUsed time.Time
-	}
-
 	// TLSConfig holds TLS configuration for the proxy server
 	TLSConfig struct {
 		// Enable TLS support
@@ -56,7 +41,6 @@ type (
 	ProxyServer struct {
 		listenAddr     string
 		router         Router
-		pools          map[string]*ConnectionPool
 		mu             sync.RWMutex
 		tlsConfig      *TLSConfig
 		limits         *Limits
@@ -110,7 +94,6 @@ func NewProxyServer(listenAddr string, router Router) *ProxyServer {
 	return &ProxyServer{
 		listenAddr: listenAddr,
 		router:     router,
-		pools:      make(map[string]*ConnectionPool),
 	}
 }
 
