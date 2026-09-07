@@ -1,0 +1,8 @@
+# Load-bearing, not tidiness: excluding .git is what stops Go's -buildvcs
+# stamping from failing in the build stage. The workflow passes the version in
+# through build-args instead.
+.git
+.github
+dist
+*.md
+*.png
