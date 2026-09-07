@@ -1,19 +1,22 @@
-# Publishes ghcr.io/boringsql/pgmuxd on a tag.
+# Builds ghcr.io/boringsql/pgmuxd on every push.
 #
-# The package inherits the repository's visibility, so a private repo yields a
-# private image with no extra step — and a Nomad client then needs a pull
-# credential, which is the cost of the digest.
+#   :sha-<commit>      every push — this is the one to pin
+#   :<branch>          moving, for convenience
+#   :vX.Y.Z            on a tag push
+#
+# The run summary prints the digest line to paste into a Nomad job file.
 
 name: image
 
 on:
   push:
+    branches: ['**']
     tags: ['v*']
+  workflow_dispatch:
 
-# Two tags pushed a minute apart would otherwise race.
 concurrency:
   group: image-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -27,17 +30,26 @@ jobs:
         with:
           fetch-depth: 0        # the ldflags come from git describe
 
-      - id: meta
+      - id: vcs
         run: |
           echo "version=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
           echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          # From the commit, not the clock, so the same tag rebuilds identically.
+          # From the commit, not the clock, so the same source rebuilds identically.
           echo "date=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - run: go test ./...
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/boringsql/pgmuxd
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=tag
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -54,25 +66,21 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          provenance: false     # keep the manifest a plain multi-arch index
+          provenance: false
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            COMMIT=${{ steps.meta.outputs.commit }}
-            BUILD_DATE=${{ steps.meta.outputs.date }}
-          # No `latest`. The digest is the identity — that is the whole reason
-          # for publishing an image rather than a binary — and a floating tag
-          # would just be something else to get wrong.
-          tags: ghcr.io/boringsql/pgmuxd:${{ github.ref_name }}
+            VERSION=${{ steps.vcs.outputs.version }}
+            COMMIT=${{ steps.vcs.outputs.commit }}
+            BUILD_DATE=${{ steps.vcs.outputs.date }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      # The digest is what goes in the Nomad job file, so hand it over rather
-      # than making someone run `imagetools inspect` to find it.
       - run: |
           {
-            echo '## pgmuxd ${{ github.ref_name }}'
-            echo
-            echo 'Pin this in `nomad/boringsql.nomad.hcl`:'
+            echo '## pgmuxd'
             echo
             echo '```'
-            echo 'image = "ghcr.io/boringsql/pgmuxd:${{ github.ref_name }}@${{ steps.build.outputs.digest }}"'
+            echo 'default = "ghcr.io/boringsql/pgmuxd@${{ steps.build.outputs.digest }}"'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
