@@ -42,10 +42,16 @@ jobs:
           go-version-file: go.mod
       - run: go test ./...
 
+      # Derived, never hard-coded: GITHUB_TOKEN can only push to packages owned by
+      # this repository's owner. Lowercased because ghcr rejects capitals and
+      # this org has one.
+      - id: owner
+        run: echo "lc=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/boringsql/pgmuxd
+          images: ghcr.io/${{ steps.owner.outputs.lc }}/pgmuxd
           tags: |
             type=sha,format=long
             type=ref,event=branch
@@ -81,6 +87,6 @@ jobs:
             echo '## pgmuxd'
             echo
             echo '```'
-            echo 'default = "ghcr.io/boringsql/pgmuxd@${{ steps.build.outputs.digest }}"'
+            echo 'default = "ghcr.io/${{ steps.owner.outputs.lc }}/pgmuxd@${{ steps.build.outputs.digest }}"'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
