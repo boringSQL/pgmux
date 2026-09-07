@@ -310,7 +310,6 @@ Please note, MD5 authentication won't work if the username is rewritten by a pro
 - No rate limiting — `Limits.MaxConnectionsPerIP` caps concurrent connections
   per source address, but nothing throttles connection *attempts*
 - No PROXY protocol support, in either direction
-- `CancelRequest` (Ctrl-C) is not forwarded to the backend
 - MD5 authentication cannot work through a username rewrite (see Protocol Support)
 - TLS to the client is always available; TLS to the backend is opt-in per
   `BackendConfig` (see Security model)
@@ -378,9 +377,17 @@ claim in either direction, here is what has actually been done and what has not.
   PostgreSQL's. A misconfigured `pg_hba.conf` produces a message naming the
   pgMux host's address as the backend sees it, so get `pg_hba.conf` right before
   going public.
-- **`CancelRequest` is not forwarded.** A visitor pressing Ctrl-C does not stop
-  the query on the backend; it keeps running. Set `statement_timeout` on the
-  backend role.
+- **`CancelRequest` is forwarded**, so Ctrl-C stops the query. pgMux issues each
+  session its own cancel key and keeps the backend's: the key a client holds is
+  random, works only through the proxy, and stops working the moment the session
+  ends. A cancel for an unknown key is closed silently, exactly as a live one is,
+  so it cannot be used to probe for valid keys. A cancel still opens a fresh
+  connection and occupies a session slot for as long as the backend dial takes.
+  Because the key is synthetic, the PID a client sees is not the backend's:
+  `PQbackendPID` and any "find me in `pg_stat_activity` by PID" workflow will
+  not match, the same class of caveat as the psql prompt above.
+  Set `statement_timeout` on the backend role anyway — it is the backstop for a
+  client that vanished instead of cancelling.
 - **No protection against slow-read or resource-exhaustion attacks** beyond the
   timeouts and ceilings above.
 - **A backend outage holds connection slots.** A failed dial retries three times

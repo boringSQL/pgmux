@@ -61,6 +61,8 @@ type (
 		sem            chan struct{}
 		ipMu           sync.Mutex
 		perIP          map[string]int
+		cancelMu       sync.Mutex
+		cancelKeys     map[cancelKey]cancelTarget
 		accepted       atomic.Uint64
 		rejected       atomic.Uint64
 		rejectedPerIP  atomic.Uint64
@@ -134,6 +136,7 @@ func NewProxyServer(listenAddr string, router Router) *ProxyServer {
 		conns:        make(map[net.Conn]struct{}),
 		backendConns: make(map[net.Conn]struct{}),
 		perIP:        make(map[string]int),
+		cancelKeys:   make(map[cancelKey]cancelTarget),
 	}
 }
 
@@ -632,10 +635,6 @@ func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn
 	ps.log().Debug("startup message type", "client", addrString(clientConn.RemoteAddr()), "type", fmt.Sprintf("%T", startupMsg))
 
 	switch msg := startupMsg.(type) {
-	case *pgproto3.StartupMessage:
-		clientConn.SetReadDeadline(time.Time{})
-		ps.log().Debug("protocol version", "major", msg.ProtocolVersion>>16, "minor", msg.ProtocolVersion&0xFFFF)
-		ps.handleStartupMessage(ctx, backend, msg, clientConn)
 	case *pgproto3.SSLRequest:
 		ps.handleSSLRequest(ctx, backend, clientConn)
 	case *pgproto3.GSSEncRequest:
@@ -655,17 +654,34 @@ func (ps *ProxyServer) handleConnection(ctx context.Context, clientConn net.Conn
 			return
 		}
 		clientConn.SetReadDeadline(time.Time{})
-		switch nm := next.(type) {
-		case *pgproto3.StartupMessage:
-			ps.handleStartupMessage(ctx, backend, nm, clientConn)
-		case *pgproto3.SSLRequest:
+		if _, ok := next.(*pgproto3.SSLRequest); ok {
 			ps.handleSSLRequest(ctx, backend, clientConn)
-		default:
-			ps.log().Debug("unexpected startup message after GSS declined",
-				"client", addrString(clientConn.RemoteAddr()), "type", fmt.Sprintf("%T", nm))
+			return
 		}
+		ps.dispatchStartup(ctx, backend, next, clientConn)
 	default:
-		ps.log().Debug("unexpected startup message type", "client", addrString(clientConn.RemoteAddr()), "type", fmt.Sprintf("%T", msg))
+		clientConn.SetReadDeadline(time.Time{})
+		ps.dispatchStartup(ctx, backend, msg, clientConn)
+	}
+}
+
+// dispatchStartup routes a startup-phase message once any negotiation is
+// settled. Four paths reach it — a bare message, one after a declined
+// SSLRequest, one over TLS, and one after a declined GSSEncRequest — so
+// message handling lives here rather than being repeated, and forgotten, in
+// each branch. CancelRequest was previously dropped on all four.
+func (ps *ProxyServer) dispatchStartup(ctx context.Context, backend *pgproto3.Backend,
+	msg pgproto3.FrontendMessage, clientConn net.Conn,
+) {
+	switch m := msg.(type) {
+	case *pgproto3.StartupMessage:
+		ps.log().Debug("protocol version", "major", m.ProtocolVersion>>16, "minor", m.ProtocolVersion&0xFFFF)
+		ps.handleStartupMessage(ctx, backend, m, clientConn)
+	case *pgproto3.CancelRequest:
+		ps.forwardCancel(ctx, m, clientConn)
+	default:
+		ps.log().Debug("unexpected startup message type",
+			"client", addrString(clientConn.RemoteAddr()), "type", fmt.Sprintf("%T", msg))
 	}
 }
 
@@ -687,9 +703,7 @@ func (ps *ProxyServer) handleSSLRequest(ctx context.Context, backend *pgproto3.B
 			return
 		}
 		clientConn.SetReadDeadline(time.Time{})
-		if sm, ok := startupMsg.(*pgproto3.StartupMessage); ok {
-			ps.handleStartupMessage(ctx, backend, sm, clientConn)
-		}
+		ps.dispatchStartup(ctx, backend, startupMsg, clientConn)
 		return
 	}
 
@@ -715,10 +729,7 @@ func (ps *ProxyServer) handleSSLRequest(ctx context.Context, backend *pgproto3.B
 		return
 	}
 	tlsConn.SetReadDeadline(time.Time{})
-
-	if sm, ok := startupMsg.(*pgproto3.StartupMessage); ok {
-		ps.handleStartupMessage(ctx, tlsBackend, sm, tlsConn)
-	}
+	ps.dispatchStartup(ctx, tlsBackend, startupMsg, tlsConn)
 }
 
 func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *pgproto3.Backend,
@@ -834,7 +845,17 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 		return
 	}
 
-	if err := ps.handleAuthentication(clientBackend, serverFrontend, clientConn, backendConn); err != nil {
+	// Installed before the call, so a panic during authentication cannot
+	// strand an entry: the registry is the one piece of per-session state
+	// with no other bound.
+	var issued cancelKey
+	defer func() {
+		if issued != (cancelKey{}) {
+			ps.forgetCancelKey(issued)
+		}
+	}()
+
+	if err := ps.handleAuthentication(clientBackend, serverFrontend, clientConn, backendConn, backendConfig, &issued); err != nil {
 		ps.log().Warn("authentication failed", "client", addrString(clientAddr), "user", originalUser, "error", err)
 		return
 	}
@@ -846,8 +867,12 @@ func (ps *ProxyServer) handleStartupMessage(ctx context.Context, clientBackend *
 	ps.proxyMessages(ctx, clientBackend, serverFrontend, clientConn, backendConn)
 }
 
+// handleAuthentication relays the authentication exchange. It returns the
+// cancel key issued to the client, which the caller must forget when the
+// session ends — a non-zero key is returned even alongside an error, because
+// BackendKeyData can arrive before the exchange fails.
 func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, serverFrontend *pgproto3.Frontend,
-	clientConn, serverConn net.Conn,
+	clientConn, serverConn net.Conn, backendConfig *BackendConfig, issued *cancelKey,
 ) error {
 	// Set a reasonable timeout for authentication
 	serverConn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -857,6 +882,7 @@ func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, ser
 		clientConn.SetReadDeadline(time.Time{})
 	}()
 
+authLoop:
 	for {
 		msg, err := serverFrontend.Receive()
 		if err != nil {
@@ -952,8 +978,13 @@ func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, ser
 					buf, _ = msg.Encode(nil)
 				case *pgproto3.AuthenticationOk:
 					buf, _ = msg.Encode(nil)
-					clientConn.Write(buf)
-					return nil
+					if _, err := clientConn.Write(buf); err != nil {
+						return fmt.Errorf("failed to send auth ok to client: %w", err)
+					}
+					// Not the end of the exchange: ParameterStatus,
+					// BackendKeyData and ReadyForQuery still follow, and
+					// BackendKeyData is where the cancel key is issued.
+					continue authLoop
 				case *pgproto3.ErrorResponse:
 					ps.log().Warn("backend rejected authentication",
 						"code", msg.Code, "message", msg.Message,
@@ -994,7 +1025,19 @@ func (ps *ProxyServer) handleAuthentication(clientBackend *pgproto3.Backend, ser
 		case *pgproto3.ParameterStatus:
 			buf, _ = msg.Encode(nil)
 		case *pgproto3.BackendKeyData:
-			buf, _ = msg.Encode(nil)
+			// Substituted, never relayed: the backend's key names its real
+			// PID and is only usable against the backend's own address.
+			key, err := ps.registerCancelKey(backendConfig, msg)
+			if err != nil {
+				return fmt.Errorf("failed to register cancel key: %w", err)
+			}
+			// A second BackendKeyData would otherwise strand the first entry
+			// in the registry, pointing at a live backend PID for good.
+			if *issued != (cancelKey{}) {
+				ps.forgetCancelKey(*issued)
+			}
+			*issued = key
+			buf, _ = (&pgproto3.BackendKeyData{ProcessID: key.pid, SecretKey: key.secret}).Encode(nil)
 		case *pgproto3.ReadyForQuery:
 			buf, _ = msg.Encode(nil)
 			_, err = clientConn.Write(buf)
@@ -1131,7 +1174,11 @@ func (ps *ProxyServer) proxyMessages(ctx context.Context, clientBackend *pgproto
 				case *pgproto3.ParameterStatus:
 					buf, _ = m.Encode(nil)
 				case *pgproto3.BackendKeyData:
-					buf, _ = m.Encode(nil)
+					// Dropped, not relayed: BackendKeyData belongs to startup,
+					// and forwarding one here would hand the client the real
+					// backend PID that the substitution during auth withheld.
+					ps.log().Debug("dropping unexpected BackendKeyData from backend")
+					continue
 				case *pgproto3.ParseComplete:
 					buf, _ = m.Encode(nil)
 				case *pgproto3.BindComplete:
