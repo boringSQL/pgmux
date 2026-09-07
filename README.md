@@ -152,6 +152,40 @@ the behaviour before this feature existed, and what per-user setups want:
 "app_user": {Host: "10.0.1.50", Port: 5432, User: "postgres"}
 ```
 
+## Limits
+
+```go
+proxy.WithLimits(&pgmux.Limits{
+    MaxConnections:      100,           // global ceiling; default 1024
+    MaxConnectionsPerIP: 10,            // per source address; default 0 (off)
+    MaxMessageSize:      1 << 20,       // client-facing reads; default 16 MiB
+    ClientIdleTimeout:   5 * time.Minute, // default 0 (disabled)
+})
+```
+
+`MaxConnections` alone is a ceiling, not fairness: one host can fill it with
+sockets that never send a startup message and hold the endpoint down in
+`startupTimeout` windows. `MaxConnectionsPerIP` gives each source its own share.
+Both refusals send a `53300` FATAL and are counted by `Stats()`
+(`Rejected`, and `RejectedPerIP` for the per-address subset).
+
+Two things to get right before enabling the per-IP cap:
+
+- **It needs the real client address.** Behind an L4 balancer, HAProxy in
+  `mode tcp`, or nginx `stream` without PROXY protocol — which pgMux does not
+  support — every connection carries the balancer's address, they all share one
+  key, and the cap becomes a global limit that locks everyone out.
+- **Shared egress is one client.** A university or corporate NAT, or a CGNAT
+  range, counts as a single source. IPv6 sources are keyed by `/64` rather than
+  by address, for the same reason in reverse: a `/64` is the smallest normal
+  end-site allocation, so keying on the full address would give anyone with a
+  VPS 2^64 keys and make the limit decorative. Pick a value with room for a
+  shared source — 5–10 for a showcase endpoint, not 1–2.
+
+Rejections are logged at debug level only: past a cap, an unauthenticated
+client would otherwise choose your log volume by reconnecting. Poll `Stats()`
+if you want a saturation signal.
+
 ## Per-connection values: WithStartupRewrite
 
 A `Router` only sees the username, so it cannot supply anything that varies per
@@ -273,7 +307,8 @@ Please note, MD5 authentication won't work if the username is rewritten by a pro
 
 - No connection pooling (creates a new backend connection per client)
 - No query rewriting or filtering (not planned at this time)
-- No rate limiting or per-client quotas — use a packet filter for that
+- No rate limiting — `Limits.MaxConnectionsPerIP` caps concurrent connections
+  per source address, but nothing throttles connection *attempts*
 - No PROXY protocol support, in either direction
 - `CancelRequest` (Ctrl-C) is not forwarded to the backend
 - MD5 authentication cannot work through a username rewrite (see Protocol Support)
@@ -325,9 +360,11 @@ claim in either direction, here is what has actually been done and what has not.
 
 **Not hardened — handle these outside pgMux:**
 
-- **No rate limiting, connection throttling or per-IP quotas.** `MaxConnections`
-  is a global ceiling, not fairness: a single source can occupy all of it. Use
-  nftables/pf or an equivalent in front of the listener.
+- **No rate limiting or connection throttling.** `Limits.MaxConnectionsPerIP`
+  gives `MaxConnections` some fairness — a single source can no longer occupy
+  the whole ceiling — but it caps concurrency, not attempt rate, and it is off
+  by default. Nothing slows a host that reconnects in a loop, and a distributed
+  source defeats it. Use nftables/pf or an equivalent in front of the listener.
 - **No authorisation of its own.** pgMux relays authentication; it never decides
   who may connect. Everything about what a visitor can *do* is the backend's
   `pg_hba.conf`, roles and grants. For a public endpoint, that means a

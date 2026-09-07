@@ -38,9 +38,14 @@ type (
 	// Limits configures runtime resource limits on the proxy.
 	// Zero or negative values fall back to defaults.
 	Limits struct {
-		MaxConnections    int           // default 1024
-		MaxMessageSize    int           // bytes, default 16 MiB; applies to client-facing reads only
-		ClientIdleTimeout time.Duration // kills conn if client sends nothing for this long; 0 disables (default)
+		MaxConnections int // default 1024
+		// MaxConnectionsPerIP caps concurrent connections per source
+		// address; 0 (default) is unlimited. IPv6 is keyed by /64.
+		// Requires the peer address to be the real client: behind a
+		// shared egress (L4 balancer, NAT) one key covers many clients.
+		MaxConnectionsPerIP int
+		MaxMessageSize      int           // bytes, default 16 MiB; applies to client-facing reads only
+		ClientIdleTimeout   time.Duration // kills conn if client sends nothing for this long; 0 disables (default)
 	}
 
 	// ProxyServer is a PostgreSQL proxy server that routes connections based on username
@@ -54,8 +59,11 @@ type (
 		backendConns   map[net.Conn]struct{}
 		wg             sync.WaitGroup
 		sem            chan struct{}
+		ipMu           sync.Mutex
+		perIP          map[string]int
 		accepted       atomic.Uint64
 		rejected       atomic.Uint64
+		rejectedPerIP  atomic.Uint64
 		tlsConfig      *TLSConfig
 		limits         *Limits
 		logger         *slog.Logger
@@ -72,8 +80,10 @@ type (
 	Stats struct {
 		Current  int    // sessions being handled right now
 		Accepted uint64 // connections admitted since Start
-		Rejected uint64 // connections refused at the connection cap
-		Max      int    // configured connection cap
+		Rejected uint64 // connections refused at either cap
+		// RejectedPerIP is the subset refused by MaxConnectionsPerIP
+		RejectedPerIP uint64
+		Max           int // configured connection cap
 	}
 )
 
@@ -123,6 +133,7 @@ func NewProxyServer(listenAddr string, router Router) *ProxyServer {
 		closing:      make(chan struct{}),
 		conns:        make(map[net.Conn]struct{}),
 		backendConns: make(map[net.Conn]struct{}),
+		perIP:        make(map[string]int),
 	}
 }
 
@@ -172,6 +183,13 @@ func (ps *ProxyServer) maxConnections() int {
 		return ps.limits.MaxConnections
 	}
 	return defaultMaxConnections
+}
+
+func (ps *ProxyServer) maxConnectionsPerIP() int {
+	if ps.limits != nil && ps.limits.MaxConnectionsPerIP > 0 {
+		return ps.limits.MaxConnectionsPerIP
+	}
+	return 0
 }
 
 func (ps *ProxyServer) maxMessageSize() int {
@@ -267,11 +285,24 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 			}
 		}
 
+		// Checked before the global semaphore so one host cannot take every slot.
+		ip := remoteIP(conn)
+		if !ps.reserveIP(ip) {
+			ps.rejected.Add(1)
+			ps.rejectedPerIP.Add(1)
+			go func() {
+				defer ps.recoverConn(conn.RemoteAddr())
+				ps.rejectOverCapacity(conn, "at max connections for this address")
+			}()
+			continue
+		}
+
 		select {
 		case sem <- struct{}{}:
 			// Must not start a session once Shutdown has stopped waiting.
 			if !ps.trackConn(conn) {
 				<-sem
+				ps.releaseIP(ip)
 				conn.Close()
 				continue
 			}
@@ -281,20 +312,73 @@ func (ps *ProxyServer) Start(ctx context.Context) error {
 			ps.log().Info("connection accepted", "client", conn.RemoteAddr().String())
 			go func() {
 				defer func() { <-sem }()
+				defer ps.releaseIP(ip)
 				defer ps.untrackConn(conn)
 				defer ps.recoverConn(conn.RemoteAddr())
 				ps.handleConnection(ctx, conn)
 			}()
 		default:
+			ps.releaseIP(ip)
 			ps.rejected.Add(1)
 			// In a goroutine so a client that stops reading cannot stall the
 			// accept loop.
 			go func() {
 				defer ps.recoverConn(conn.RemoteAddr())
-				ps.rejectOverCapacity(conn)
+				ps.rejectOverCapacity(conn, "at max connections")
 			}()
 		}
 	}
+}
+
+// ipv6ClientPrefix is the smallest standard end-site allocation; keying on
+// the full /128 would let anyone with a /64 hold 2^64 keys
+const ipv6ClientPrefix = 64
+
+// remoteIP returns the per-IP limit's key: the source address without port.
+func remoteIP(conn net.Conn) string {
+	addr, ok := conn.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		host, _, err := net.SplitHostPort(addrString(conn.RemoteAddr()))
+		if err != nil {
+			return addrString(conn.RemoteAddr())
+		}
+		return host
+	}
+
+	// To4 also folds IPv4-mapped IPv6 (::ffff:1.2.3.4) into one key
+	if v4 := addr.IP.To4(); v4 != nil {
+		return v4.String()
+	}
+	return addr.IP.Mask(net.CIDRMask(ipv6ClientPrefix, 128)).String()
+}
+
+// reserveIP takes one of ip's slots, reporting false when none are left.
+// Every true must be paired with a releaseIP
+func (ps *ProxyServer) reserveIP(ip string) bool {
+	limit := ps.maxConnectionsPerIP()
+	if limit <= 0 {
+		return true
+	}
+
+	ps.ipMu.Lock()
+	defer ps.ipMu.Unlock()
+	if ps.perIP[ip] >= limit {
+		return false
+	}
+	ps.perIP[ip]++
+	return true
+}
+
+// releaseIP returns a slot, using the count rather than re-reading the limit.
+func (ps *ProxyServer) releaseIP(ip string) {
+	ps.ipMu.Lock()
+	defer ps.ipMu.Unlock()
+	// Delete at zero so the map, keyed by client addresses, stays bounded.
+	if ps.perIP[ip] <= 1 {
+		delete(ps.perIP, ip)
+		return
+	}
+	ps.perIP[ip]--
 }
 
 // Stats reports the proxy's current connection accounting. Safe to call
@@ -306,10 +390,11 @@ func (ps *ProxyServer) Stats() Stats {
 
 	// Current reads the semaphore so the live count cannot drift from the cap.
 	return Stats{
-		Current:  len(sem),
-		Accepted: ps.accepted.Load(),
-		Rejected: ps.rejected.Load(),
-		Max:      ps.maxConnections(),
+		Current:       len(sem),
+		Accepted:      ps.accepted.Load(),
+		Rejected:      ps.rejected.Load(),
+		RejectedPerIP: ps.rejectedPerIP.Load(),
+		Max:           ps.maxConnections(),
 	}
 }
 
@@ -517,9 +602,11 @@ func (ps *ProxyServer) sendFatal(conn net.Conn, code, message string) {
 	conn.SetWriteDeadline(time.Time{})
 }
 
-func (ps *ProxyServer) rejectOverCapacity(conn net.Conn) {
+func (ps *ProxyServer) rejectOverCapacity(conn net.Conn, reason string) {
 	defer conn.Close()
-	ps.log().Warn("rejecting connection: at max connections", "client", addrString(conn.RemoteAddr()))
+	// Debug, not Warn: an unauthenticated client must not set log volume by
+	// reconnecting once a cap is reached. Stats() counts these
+	ps.log().Debug("rejecting connection", "client", addrString(conn.RemoteAddr()), "reason", reason)
 	errorMsg := &pgproto3.ErrorResponse{
 		Severity: "FATAL",
 		Code:     "53300",
