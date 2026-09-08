@@ -19,7 +19,11 @@ Originally created to provide routing for [SQL Labs](https://labs.boringsql.com/
 - Startup-parameter rewrite hook for per-connection values
 - Full PostgreSQL protocol support
 - SSL/TLS support for secure client connections, opt-in TLS to the backend
+- Optional refusal of plaintext connections, with certificate reload on renewal
+- Graceful drain, connection stats, and per-IP connection limits
+- `CancelRequest` forwarding, with a per-session key the client cannot reuse
 - Pluggable routing via Router interface
+- `cmd/pgmuxd`: a ready-made, environment-configured binary for open endpoints
 
 ## Quick Start
 
@@ -287,6 +291,127 @@ func (r *RestRouter) Route(ctx context.Context, username string) (*pgmux.Backend
     return config, nil
 }
 ```
+
+## pgmuxd: the ready-made binary
+
+`cmd/pgmuxd` is pgMux wired up for one job: a single backend, one role and one
+database for every visitor, TLS mandatory. It exists so an open endpoint is a
+job file rather than a program.
+
+```console
+$ go build ./cmd/pgmuxd     # or scripts/build.sh for static release binaries
+```
+
+Everything comes from the environment; there is no config file and nothing is
+reloaded except the TLS certificate.
+
+| Variable | Required | Default | |
+|---|---|---|---|
+| `PGMUXD_LISTEN` | yes | | e.g. `0.0.0.0:5432` |
+| `PGMUXD_BACKEND_HOST` | yes | | |
+| `PGMUXD_BACKEND_PORT` | | `5432` | |
+| `PGMUXD_BACKEND_USER` | yes | | the role every visitor becomes |
+| `PGMUXD_BACKEND_DATABASE` | yes | | required: libpq defaults `dbname` to the caller's OS username |
+| `PGMUXD_TLS_CERT` / `PGMUXD_TLS_KEY` | yes | | absent means it will not start |
+| `PGMUXD_MAX_CONNECTIONS` | | `100` | |
+| `PGMUXD_MAX_CONNECTIONS_PER_IP` | | `5` | `0` disables |
+| `PGMUXD_MAX_MESSAGE_SIZE` | | `1MiB` | |
+| `PGMUXD_CLIENT_IDLE_TIMEOUT` | | `5m` | |
+| `PGMUXD_STATEMENT_TIMEOUT` | | `30s` | a default for every session, not a limit |
+| `PGMUXD_IDLE_TX_TIMEOUT` | | `60s` | a default for every session, not a limit |
+| `PGMUXD_BACKEND_TLS` | | off | `1` encrypts the hop to the backend |
+| `PGMUXD_HEALTH_ADDR` | | `127.0.0.1:8080` | must be loopback |
+| `PGMUXD_LOG_LEVEL` | | `info` | `debug` adds per-connection detail |
+| `PGMUXD_DRAIN_TIMEOUT` | | `4s` | see `kill_timeout` below |
+
+Configuration is validated in full before anything binds — including loading the
+keypair — and one run reports every problem, not the first:
+
+```console
+$ pgmuxd
+pgmuxd: invalid configuration
+  - PGMUXD_BACKEND_DATABASE is required
+  - PGMUXD_HEALTH_ADDR "0.0.0.0:8080": must be a loopback address
+```
+
+The injected `statement_timeout` and `idle_in_transaction_session_timeout` are
+defaults, not limits — both are `USERSET`, so a visitor can raise them with
+`SET`. They stop the accidental runaway query; `PGMUXD_MAX_CONNECTIONS`,
+`PGMUXD_CLIENT_IDLE_TIMEOUT` and backend-side supervision are what bound a
+determined one.
+
+**It refuses to run without TLS**, and refuses plaintext connections once
+running. That is the client hop; the backend hop is cleartext unless
+`PGMUXD_BACKEND_TLS=1`, and pgmuxd warns at startup if the backend is not
+loopback and TLS is off. That guarantee moves out of `pg_hba.conf` when TLS terminates at the
+proxy, and a typo must not put a plaintext PostgreSQL on the public internet.
+
+### /healthz
+
+Loopback only. It opens a real connection to the backend rather than checking
+the listener, so a proxy whose database is dead does not stay in service:
+
+```json
+{ "status": "ok", "version": "v0.1.0", "commit": "8d0be2a",
+  "backend": {"reachable": true, "latency_ms": 3, "max_connections": 100,
+              "superuser_reserved_connections": 3, "reserved_connections": 0},
+  "connections": {"current": 4, "accepted": 1281, "rejected": 0,
+                  "rejected_per_ip": 0, "max": 100} }
+```
+
+The backend is probed on a timer, not per request, so a burst of health checks
+cannot turn into a burst of backend connections. `200` when healthy; `503` while
+starting, while draining, and after three consecutive probe failures. One blip
+reports `degraded` and stays in service, because flapping an endpoint out of
+Consul is worse than a briefly busy database. A proxy at its connection cap
+reports `saturated` and stays in service too: with a single instance,
+deregistering denies everyone rather than the few being refused. The backend's
+connection ceilings are read at startup and every five minutes, and compared to
+`PGMUXD_MAX_CONNECTIONS` in the log, so the number in the job file and the
+number in `postgresql.conf` cannot drift apart unnoticed.
+
+### Running it under Nomad
+
+```hcl
+task "pgmuxd" {
+  driver = "exec"
+  config { command = "pgmuxd" }
+
+  artifact {
+    source   = "https://your.host/pgmuxd-linux-amd64"
+    options { checksum = "sha256:..." }   # from dist/SHA256SUMS
+  }
+
+  # Must exceed PGMUXD_DRAIN_TIMEOUT, or the drain is SIGKILLed halfway.
+  # Nomad's default is 5s, which is why pgmuxd's drain defaults to 4s.
+  kill_timeout = "30s"
+  env { PGMUXD_DRAIN_TIMEOUT = "25s" }
+}
+```
+
+SIGTERM stops accepting, flips `/healthz` to `503` so Consul deregisters first,
+then drains open sessions against the deadline. It exits `0` even if the drain
+runs out of time — SIGTERM is operator-initiated, and a non-zero exit on every
+deploy would feed Nomad's restart and reschedule counters. Non-zero is reserved
+for a bad configuration or a listener that will not bind.
+
+The binary is static (`CGO_ENABLED=0`), runs as an unprivileged user, and needs
+no capabilities: 5432 is above 1024.
+
+### Tests
+
+```console
+$ go test ./...                              # no docker required
+$ go test -tags=integration ./cmd/pgmuxd/    # starts a real PostgreSQL
+$ PGMUXD_INTEGRATION_STRICT=1 go test -tags=integration ./cmd/pgmuxd/   # CI: fail instead of skip
+```
+
+The integration test starts PostgreSQL in a container pinned by digest, runs
+`psql` with **no `-U` and no `-d`**, and asserts `current_user` and
+`current_database` are the configured ones — plus that `sslmode=disable` is
+refused, on both the plain and `gssencmode=prefer` paths. It also SIGTERMs the
+proxy mid-query and asserts the query still returns — the drain is the subtlest
+thing in the binary, and that is the test guarding it.
 
 ## Examples
 
